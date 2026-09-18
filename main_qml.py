@@ -932,6 +932,26 @@ class SystemIconProvider(QQuickImageProvider):
         return pixmap
 
 
+def _macos_major() -> int:
+    import platform
+    try:
+        return int(platform.mac_ver()[0].split(".")[0])
+    except ValueError:
+        return 0
+
+
+def _ax_tr(locale_mgr: "LocaleManager", key: str) -> str:
+    """macOS 27 renamed the Accessibility privacy pane to "Device Control and
+    Data Access". Prefer a ``<key>.macos27`` string there; locales without
+    one fall back to the classic wording."""
+    if _macos_major() >= 27:
+        variant = f"{key}.macos27"
+        text = locale_mgr.tr(variant)
+        if text != variant:  # tr() echoes the key when it is missing
+            return text
+    return locale_mgr.tr(key)
+
+
 def _check_accessibility(locale_mgr: "LocaleManager") -> bool:
     """Verify the macOS Accessibility grant. Returns True only when
     AXIsProcessTrustedWithOptions confirms the grant; any other path
@@ -949,9 +969,9 @@ def _check_accessibility(locale_mgr: "LocaleManager") -> bool:
         print("[Mouser] Accessibility permission not granted")
         msg = QMessageBox()
         msg.setIcon(QMessageBox.Icon.Warning)
-        msg.setWindowTitle(locale_mgr.tr("accessibility.title"))
-        msg.setText(locale_mgr.tr("accessibility.text"))
-        msg.setInformativeText(locale_mgr.tr("accessibility.info"))
+        msg.setWindowTitle(_ax_tr(locale_mgr, "accessibility.title"))
+        msg.setText(_ax_tr(locale_mgr, "accessibility.text"))
+        msg.setInformativeText(_ax_tr(locale_mgr, "accessibility.info"))
         msg.setStandardButtons(QMessageBox.StandardButton.Ok)
         msg.exec()
     return bool(trusted)

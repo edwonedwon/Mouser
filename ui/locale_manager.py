@@ -278,6 +278,18 @@ _TRANSLATIONS = {
             "Please grant permission, then restart Mouser."
         ),
         "accessibility.info": "System Settings -> Privacy & Security -> Accessibility",
+        # macOS 27 renamed the pane; main_qml._ax_tr picks these there.
+        "accessibility.title.macos27": "Device Control Permission Required",
+        "accessibility.text.macos27": (
+            "Mouser needs Device Control and Data Access permission to "
+            "intercept mouse button events.\n\n"
+            "macOS should have opened the System Settings prompt.\n"
+            "Please grant permission, then restart Mouser."
+        ),
+        "accessibility.info.macos27": (
+            "System Settings -> Privacy & Security -> "
+            "Device Control and Data Access"
+        ),
 
         # Common dialog chrome
         "dialog.close": "Close",
