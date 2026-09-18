@@ -1698,6 +1698,11 @@ class HidGestureListener:
         if self._feat_idx is None:
             return
         self._extra_divert_acks.clear()
+        # Re-offer statics dropped by a failed divert on an earlier connect.
+        # Right after wake / login the device often rejects setCidReporting,
+        # and without this the CID stayed gone for the life of the process.
+        for cid, info in self._static_extra_diverts.items():
+            self._extra_diverts.setdefault(cid, {**info, "held": False})
         failed: list[int] = []
         for cid in list(self._extra_diverts.keys()):
             resp = self._set_cid_reporting(cid, _DIVERT_BUTTON_ONLY)

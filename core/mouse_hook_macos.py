@@ -517,10 +517,15 @@ class MouseHook(BaseMouseHook):
 
         def _re_enable_tap_and_reconnect(reason):
             if self._tap and self._running:
-                Quartz.CGEventTapEnable(self._tap, True)
-                ok = Quartz.CGEventTapIsEnabled(self._tap)
+                # Recreate rather than re-enable: after sleep or a login
+                # round-trip the old tap can report enabled yet deliver no
+                # events. HID-diverted buttons keep working, but pan (which
+                # needs mouse-moved events from the tap) goes dead.
+                self.abort_button_gesture(reason)
+                self._remove_tap()
+                ok = self._install_tap()
                 print(
-                    f"[MouseHook] Event tap re-enabled ({reason}): "
+                    f"[MouseHook] Event tap recreated ({reason}): "
                     f"{'OK' if ok else 'FAILED — may need restart'}",
                     flush=True,
                 )
@@ -576,13 +581,7 @@ class MouseHook(BaseMouseHook):
         except Exception:
             pass
 
-    def start(self):
-        if not _QUARTZ_OK:
-            print("[MouseHook] Quartz not available — hook not installed")
-            return False
-        if self._running:
-            return True
-
+    def _install_tap(self):
         event_mask = (
             Quartz.CGEventMaskBit(Quartz.kCGEventMouseMoved)
             | Quartz.CGEventMaskBit(Quartz.kCGEventOtherMouseDown)
@@ -590,8 +589,7 @@ class MouseHook(BaseMouseHook):
             | Quartz.CGEventMaskBit(Quartz.kCGEventOtherMouseDragged)
             | Quartz.CGEventMaskBit(Quartz.kCGEventScrollWheel)
         )
-
-        self._tap = Quartz.CGEventTapCreate(
+        tap = Quartz.CGEventTapCreate(
             Quartz.kCGSessionEventTap,
             Quartz.kCGHeadInsertEventTap,
             Quartz.kCGEventTapOptionDefault,
@@ -599,24 +597,49 @@ class MouseHook(BaseMouseHook):
             self._event_tap_callback,
             None,
         )
+        if tap is None:
+            return False
+        self._tap = tap
+        self._tap_source = Quartz.CFMachPortCreateRunLoopSource(None, tap, 0)
+        # Main run loop, not "current": the wake observer may reinstall from
+        # whatever thread the notification lands on.
+        Quartz.CFRunLoopAddSource(
+            Quartz.CFRunLoopGetMain(),
+            self._tap_source,
+            Quartz.kCFRunLoopCommonModes,
+        )
+        Quartz.CGEventTapEnable(tap, True)
+        return True
 
-        if self._tap is None:
+    def _remove_tap(self):
+        if not self._tap:
+            return
+        Quartz.CGEventTapEnable(self._tap, False)
+        if self._tap_source:
+            Quartz.CFRunLoopRemoveSource(
+                Quartz.CFRunLoopGetMain(),
+                self._tap_source,
+                Quartz.kCFRunLoopCommonModes,
+            )
+            self._tap_source = None
+        Quartz.CFMachPortInvalidate(self._tap)
+        self._tap = None
+
+    def start(self):
+        if not _QUARTZ_OK:
+            print("[MouseHook] Quartz not available — hook not installed")
+            return False
+        if self._running:
+            return True
+
+        if not self._install_tap():
             print("[MouseHook] ERROR: Failed to create CGEventTap!")
             print("[MouseHook] Grant Accessibility permission in:")
             print(
                 "[MouseHook]   System Settings -> Privacy & Security -> Accessibility"
+                " (macOS 27+: Device Control and Data Access)"
             )
             return False
-
-        print("[MouseHook] CGEventTap created successfully", flush=True)
-
-        self._tap_source = Quartz.CFMachPortCreateRunLoopSource(None, self._tap, 0)
-        Quartz.CFRunLoopAddSource(
-            Quartz.CFRunLoopGetCurrent(),
-            self._tap_source,
-            Quartz.kCFRunLoopCommonModes,
-        )
-        Quartz.CGEventTapEnable(self._tap, True)
         print("[MouseHook] CGEventTap enabled and integrated with run loop", flush=True)
         self._running = True
 
@@ -639,15 +662,7 @@ class MouseHook(BaseMouseHook):
         self._connected_device = None
 
         if self._tap:
-            Quartz.CGEventTapEnable(self._tap, False)
-            if self._tap_source:
-                Quartz.CFRunLoopRemoveSource(
-                    Quartz.CFRunLoopGetCurrent(),
-                    self._tap_source,
-                    Quartz.kCFRunLoopCommonModes,
-                )
-                self._tap_source = None
-            self._tap = None
+            self._remove_tap()
             print("[MouseHook] CGEventTap disabled and removed", flush=True)
 
         if self._dispatch_thread:
