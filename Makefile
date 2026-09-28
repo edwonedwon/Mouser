@@ -1,7 +1,7 @@
 PY := .venv/bin/python
 APP := dist/Mouser.app
 
-.PHONY: dev release run-release install test quit clean
+.PHONY: dev run-dev run release run-release install test quit clean
 
 $(PY): requirements.txt
 	python3 -m venv .venv
@@ -18,6 +18,10 @@ quit:
 dev: $(PY) quit
 	$(PY) main_qml.py
 
+# Friendly aliases for source-checkout development launches.
+run-dev: dev
+run: dev
+
 release: $(PY)
 	./build_macos_app.sh
 
@@ -26,6 +30,10 @@ run-release: release quit
 
 # Replaces the installed copy; ditto preserves the bundle's signature.
 install: $(PY)
+	# Remove a source-checkout LaunchAgent first; otherwise it can restart the
+	# Terminal/Python build while the packaged app is being installed.
+	-launchctl bootout gui/$$(id -u) io.github.tombadash.mouser
+	rm -f "$$HOME/Library/LaunchAgents/io.github.tombadash.mouser.plist"
 	$(MAKE) quit
 	# Remove source-checkout and previous packaged builds before rebuilding. This
 	# prevents Spotlight from finding stale Mouser.app copies in the repository.
