@@ -35,6 +35,11 @@ install: $(PY)
 	-launchctl bootout gui/$$(id -u) io.github.tombadash.mouser
 	rm -f "$$HOME/Library/LaunchAgents/io.github.tombadash.mouser.plist"
 	$(MAKE) quit
+	# Reset the packaged app's Accessibility/TCC grant before replacing an ad-hoc
+	# signed build. Rebuilds can change the code identity, leaving macOS with a
+	# stale approval record that prevents the engine/mouse hook from starting.
+	-tccutil reset Accessibility io.github.tombadash.mouser
+	-tccutil reset ListenEvent io.github.tombadash.mouser
 	# Remove source-checkout and previous packaged builds before rebuilding. This
 	# prevents Spotlight from finding stale Mouser.app copies in the repository.
 	rm -rf build dist

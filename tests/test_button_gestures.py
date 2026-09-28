@@ -197,6 +197,17 @@ class BaseHookButtonGestureTests(unittest.TestCase):
         hook.abort_button_gesture("test")
         self.assertIsNone(hook._button_gesture_active_owner)
 
+    def test_hid_disconnect_clears_stuck_holds(self):
+        hook = BaseMouseHook()
+        hook.configure_button_gestures(owners={"middle"})
+        hook.arm_button_gesture("middle")
+        hook._gesture_active = True
+        hook._thumb_active = True
+        hook._on_hid_disconnect()
+        self.assertIsNone(hook._button_gesture_active_owner)
+        self.assertFalse(hook._gesture_active)
+        self.assertFalse(hook._thumb_active)
+
     def test_configure_empty_disables_and_clears(self):
         hook = self._hook()
         hook.arm_button_gesture("middle", now=0.0)

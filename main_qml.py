@@ -46,7 +46,7 @@ os.environ["QT_QUICK_CONTROLS_STYLE"] = "Material"
 os.environ["QT_QUICK_CONTROLS_MATERIAL_ACCENT"] = "#00d4aa"
 
 _t1 = _time.perf_counter()
-from PySide6.QtWidgets import QApplication, QSystemTrayIcon, QMenu, QFileIconProvider, QMessageBox
+from PySide6.QtWidgets import QApplication, QSystemTrayIcon, QMenu, QFileIconProvider
 from PySide6.QtGui import QAction, QColor, QGuiApplication, QIcon, QPainter, QPixmap, QWindow
 from PySide6.QtCore import QObject, Property, QCoreApplication, QRectF, Qt, QUrl, Signal, QFileInfo, QEvent, QTimer
 from PySide6.QtQml import QQmlApplicationEngine
@@ -1038,27 +1038,7 @@ class SystemIconProvider(QQuickImageProvider):
         return pixmap
 
 
-def _macos_major() -> int:
-    import platform
-    try:
-        return int(platform.mac_ver()[0].split(".")[0])
-    except ValueError:
-        return 0
-
-
-def _ax_tr(locale_mgr: "LocaleManager", key: str) -> str:
-    """macOS 27 renamed the Accessibility privacy pane to "Device Control and
-    Data Access". Prefer a ``<key>.macos27`` string there; locales without
-    one fall back to the classic wording."""
-    if _macos_major() >= 27:
-        variant = f"{key}.macos27"
-        text = locale_mgr.tr(variant)
-        if text != variant:  # tr() echoes the key when it is missing
-            return text
-    return locale_mgr.tr(key)
-
-
-def _check_accessibility(locale_mgr: "LocaleManager") -> bool:
+def _check_accessibility(_locale_mgr: "LocaleManager") -> bool:
     """Verify the macOS Accessibility grant. Returns True only when
     AXIsProcessTrustedWithOptions confirms the grant; any other path
     (no grant, exception during the check) returns False so callers
@@ -1072,14 +1052,11 @@ def _check_accessibility(locale_mgr: "LocaleManager") -> bool:
         print(f"[Mouser] Accessibility check failed: {exc}")
         return False
     if not trusted:
+        # AXIsProcessTrustedWithOptions(prompt=True) already shows the native
+        # macOS privacy prompt, whose title/path is OS-specific (for example,
+        # macOS 27 says "Device Control and Data Access"). Do not stack a
+        # second Mouser dialog that asks for the same permission.
         print("[Mouser] Accessibility permission not granted")
-        msg = QMessageBox()
-        msg.setIcon(QMessageBox.Icon.Warning)
-        msg.setWindowTitle(_ax_tr(locale_mgr, "accessibility.title"))
-        msg.setText(_ax_tr(locale_mgr, "accessibility.text"))
-        msg.setInformativeText(_ax_tr(locale_mgr, "accessibility.info"))
-        msg.setStandardButtons(QMessageBox.StandardButton.Ok)
-        msg.exec()
     return bool(trusted)
 
 

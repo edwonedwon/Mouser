@@ -916,20 +916,31 @@ elif sys.platform == "darwin":
         for k in keys:
             flags |= _MOD_FLAGS.get(k, 0)
 
-        # Press all
-        for k in keys:
-            ev = Quartz.CGEventCreateKeyboardEvent(None, k, True)
-            if flags:
-                Quartz.CGEventSetFlags(ev, flags)
-            Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
+        pressed = []
+        try:
+            for k in keys:
+                ev = Quartz.CGEventCreateKeyboardEvent(None, k, True)
+                if ev is None:
+                    raise RuntimeError("failed to create macOS key-down event")
+                if flags:
+                    Quartz.CGEventSetFlags(ev, flags)
+                # Treat a post that raises as possibly delivered; still send
+                # key-up in finally rather than strand a modifier.
+                pressed.append(k)
+                Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
 
-        if hold_ms:
-            time.sleep(hold_ms / 1000.0)
-
-        # Release in reverse
-        for k in reversed(keys):
-            ev = Quartz.CGEventCreateKeyboardEvent(None, k, False)
-            Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
+            if hold_ms:
+                time.sleep(hold_ms / 1000.0)
+        finally:
+            # An exception after a modifier down must never leave Cmd/Ctrl/Shift
+            # logically held and make the physical keyboard appear broken.
+            for k in reversed(pressed):
+                try:
+                    ev = Quartz.CGEventCreateKeyboardEvent(None, k, False)
+                    if ev is not None:
+                        Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
+                except Exception as exc:
+                    print(f"[KeySimulator] key release failed ({k}): {exc}")
 
     def send_key_press(vk):
         send_key_combo([vk])

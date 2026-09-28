@@ -3,7 +3,7 @@ import os
 import sys
 import types
 import unittest
-from unittest.mock import call, patch
+from unittest.mock import MagicMock, call, patch
 
 from core import key_simulator
 
@@ -24,6 +24,42 @@ class KeySimulatorActionTests(unittest.TestCase):
         self.assertEqual(key_simulator.ACTIONS["prev_tab"]["category"], "Browser")
         self.assertTrue(len(key_simulator.ACTIONS["next_tab"]["keys"]) > 0)
         self.assertTrue(len(key_simulator.ACTIONS["prev_tab"]["keys"]) > 0)
+
+
+class MacKeyReleaseTests(unittest.TestCase):
+    @unittest.skipUnless(sys.platform == "darwin", "macOS only")
+    def test_modifier_is_released_if_next_key_fails(self):
+        quartz = MagicMock()
+        calls = []
+
+        def create(_source, key, down):
+            calls.append((key, down))
+            if key == 1 and down:
+                raise RuntimeError("injection failed")
+            return object()
+
+        quartz.CGEventCreateKeyboardEvent.side_effect = create
+        with patch.object(key_simulator, "Quartz", quartz):
+            with self.assertRaises(RuntimeError):
+                key_simulator.send_key_combo([0, 1], hold_ms=0)
+        self.assertEqual(calls, [(0, True), (1, True), (0, False)])
+
+    @unittest.skipUnless(sys.platform == "darwin", "macOS only")
+    def test_modifier_is_released_if_post_raises(self):
+        quartz = MagicMock()
+        events = []
+        quartz.CGEventCreateKeyboardEvent.side_effect = lambda _src, key, down: (key, down)
+
+        def post(_tap, event):
+            events.append(event)
+            if event == (0, True):
+                raise RuntimeError("post failed after delivery")
+
+        quartz.CGEventPost.side_effect = post
+        with patch.object(key_simulator, "Quartz", quartz):
+            with self.assertRaises(RuntimeError):
+                key_simulator.send_key_combo([0, 1], hold_ms=0)
+        self.assertEqual(events, [(0, True), (0, False)])
 
 
 class CustomShortcutParsingTests(unittest.TestCase):

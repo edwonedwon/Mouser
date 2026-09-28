@@ -115,6 +115,19 @@ class AccessibilityLocaleTests(unittest.TestCase):
                         f"{locale}.{key} is blank",
                     )
 
+    def test_macos27_privacy_pane_strings_exist_in_all_locales(self):
+        required = {
+            "accessibility.title.macos27",
+            "accessibility.text.macos27",
+            "accessibility.info.macos27",
+        }
+        for locale, strings in _TRANSLATIONS.items():
+            with self.subTest(locale=locale):
+                missing = required - strings.keys()
+                self.assertFalse(missing, f"{locale} missing keys: {missing}")
+                for key in required:
+                    self.assertTrue(strings[key].strip(), f"{locale}.{key} is blank")
+
     def test_chinese_locales_do_not_passthrough_english(self):
         """Trackpad strings used to ship English text in the zh_CN and
         zh_TW maps. Pin that they are now actually localized."""

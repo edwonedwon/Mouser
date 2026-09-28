@@ -196,6 +196,11 @@ class MacOSWakeRecoveryTests(unittest.TestCase):
             self.addCleanup(self._unload_module)
 
         self.hook = self.module.MouseHook()
+        # Wake tests exercise scheduling/deduplication, not live macOS tap
+        # permissions. Never create a real CGEventTap from a unit test.
+        tap_patch = patch.object(self.hook, "_install_tap", return_value=True)
+        tap_patch.start()
+        self.addCleanup(tap_patch.stop)
         self.hook._running = True
         self.hook._device_connected = True
         self.listener = Mock()
@@ -1084,13 +1089,12 @@ class MacOSEventTapDisabledTests(unittest.TestCase):
     """Verify CGEventTap is re-enabled when macOS disables it."""
 
     def setUp(self):
+        self._original_quartz = mouse_hook.Quartz
         self.mock_quartz = MagicMock(name="Quartz")
         mouse_hook.Quartz = self.mock_quartz
 
     def tearDown(self):
-        if hasattr(mouse_hook, "Quartz") and isinstance(
-                mouse_hook.Quartz, MagicMock):
-            del mouse_hook.Quartz
+        mouse_hook.Quartz = self._original_quartz
 
     def _make_hook(self):
         hook = mouse_hook.MouseHook()
@@ -1137,12 +1141,11 @@ class MacOSTrackpadScrollFilterTests(unittest.TestCase):
     def setUp(self):
         self.mock_quartz = MagicMock(name="Quartz")
         self.mock_quartz.kCGEventScrollWheel = self._kCGEventScrollWheel
+        self._original_quartz = mouse_hook.Quartz
         mouse_hook.Quartz = self.mock_quartz
 
     def tearDown(self):
-        if hasattr(mouse_hook, "Quartz") and isinstance(
-                mouse_hook.Quartz, MagicMock):
-            del mouse_hook.Quartz
+        mouse_hook.Quartz = self._original_quartz
 
     def _make_hook(self):
         hook = mouse_hook.MouseHook()
@@ -1267,12 +1270,11 @@ class MacOSPassthroughWhenNoDeviceTests(unittest.TestCase):
         self.mock_quartz = MagicMock(name="Quartz")
         self.mock_quartz.kCGEventScrollWheel = self._kCGEventScrollWheel
         self.mock_quartz.kCGEventOtherMouseDown = self._kCGEventOtherMouseDown
+        self._original_quartz = mouse_hook.Quartz
         mouse_hook.Quartz = self.mock_quartz
 
     def tearDown(self):
-        if hasattr(mouse_hook, "Quartz") and isinstance(
-                mouse_hook.Quartz, MagicMock):
-            del mouse_hook.Quartz
+        mouse_hook.Quartz = self._original_quartz
 
     def _bare_hook(self):
         hook = mouse_hook.MouseHook()
@@ -1542,12 +1544,11 @@ class MacOSShiftWheelHScrollTests(unittest.TestCase):
             self._AXIS2_DELTA, self._AXIS2_FIXED, self._AXIS2_POINT,
         ):
             setattr(self.mock_quartz, axis_attr, axis_attr)
+        self._original_quartz = mouse_hook.Quartz
         mouse_hook.Quartz = self.mock_quartz
 
     def tearDown(self):
-        if hasattr(mouse_hook, "Quartz") and isinstance(
-                mouse_hook.Quartz, MagicMock):
-            del mouse_hook.Quartz
+        mouse_hook.Quartz = self._original_quartz
 
     def _make_hook(self, *, block_hscroll=True):
         hook = mouse_hook.MouseHook()

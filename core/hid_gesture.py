@@ -356,6 +356,13 @@ if sys.platform == "darwin":
         _cf.CFRunLoopRunInMode.argtypes = [c_void_p, ctypes.c_double, ctypes.c_bool]
         _cf.CFRunLoopRunInMode.restype = c_int
 
+        if hasattr(_iokit, "IOHIDCheckAccess"):
+            _iokit.IOHIDCheckAccess.argtypes = [c_int]
+            _iokit.IOHIDCheckAccess.restype = c_int
+        if hasattr(_iokit, "IOHIDRequestAccess"):
+            _iokit.IOHIDRequestAccess.argtypes = [c_int]
+            _iokit.IOHIDRequestAccess.restype = ctypes.c_bool
+
         _iokit.IOHIDManagerCreate.argtypes = [c_void_p, c_int]
         _iokit.IOHIDManagerCreate.restype = c_void_p
         _iokit.IOHIDManagerSetDeviceMatching.argtypes = [c_void_p, c_void_p]
@@ -400,6 +407,10 @@ if sys.platform == "darwin":
         _K_CF_STRING_ENCODING_UTF8 = 0x08000100
         _K_IOHID_REPORT_TYPE_INPUT = 0
         _K_IOHID_REPORT_TYPE_OUTPUT = 1
+        _K_IOHID_REQUEST_TYPE_LISTEN_EVENT = 1
+        _K_IOHID_ACCESS_TYPE_GRANTED = 1
+        _K_IORETURN_NOT_PERMITTED = 0xE00002E2
+        _HID_ACCESS_PROMPTED = False
         _K_CF_RUN_LOOP_DEFAULT_MODE = c_void_p.in_dll(_cf, "kCFRunLoopDefaultMode")
 
         # NSAutoreleasePool via libobjc: the IOHID paths below run on plain
@@ -446,6 +457,35 @@ if sys.platform == "darwin":
                 with _AutoreleasePool():
                     return fn(*args, **kwargs)
             return wrapper
+
+        def _maybe_request_hid_listen_access(reason=""):
+            """Request macOS Input Monitoring/HID listen access once.
+
+            Accessibility/Device Control allows the CGEventTap mouse hook, but
+            IOHIDManagerOpen can still fail with kIOReturnNotPermitted unless
+            the app is also allowed to listen to HID input devices. macOS does
+            not always show this prompt from IOHIDManagerOpen itself, so ask
+            explicitly when the IOKit symbols are available.
+            """
+            global _HID_ACCESS_PROMPTED
+            if not (hasattr(_iokit, "IOHIDCheckAccess") and hasattr(_iokit, "IOHIDRequestAccess")):
+                return False
+            try:
+                access = int(_iokit.IOHIDCheckAccess(_K_IOHID_REQUEST_TYPE_LISTEN_EVENT))
+                if access == _K_IOHID_ACCESS_TYPE_GRANTED:
+                    return True
+                if not _HID_ACCESS_PROMPTED:
+                    suffix = f" after {reason}" if reason else ""
+                    print(
+                        "[HidGesture] macOS Input Monitoring / HID listen "
+                        f"permission is not granted{suffix}; requesting access"
+                    )
+                    _HID_ACCESS_PROMPTED = True
+                    _iokit.IOHIDRequestAccess(_K_IOHID_REQUEST_TYPE_LISTEN_EVENT)
+                return False
+            except Exception as exc:
+                print(f"[HidGesture] HID listen access check failed: {exc}")
+                return False
 
         _MAC_NATIVE_OK = True
     except Exception as exc:
@@ -574,6 +614,8 @@ if _MAC_NATIVE_OK:
                 _iokit.IOHIDManagerSetDeviceMatching(manager, matching)
                 res = _iokit.IOHIDManagerOpen(manager, 0)
                 if res != 0:
+                    if (res & 0xFFFFFFFF) == _K_IORETURN_NOT_PERMITTED:
+                        _maybe_request_hid_listen_access("IOHIDManagerOpen")
                     raise OSError(f"IOHIDManagerOpen failed: 0x{res:08X}")
 
                 devices = _iokit.IOHIDManagerCopyDevices(manager)
@@ -663,6 +705,8 @@ if _MAC_NATIVE_OK:
             _iokit.IOHIDManagerSetDeviceMatching(self._manager, self._matching)
             res = _iokit.IOHIDManagerOpen(self._manager, 0)
             if res != 0:
+                if (res & 0xFFFFFFFF) == _K_IORETURN_NOT_PERMITTED:
+                    _maybe_request_hid_listen_access("IOHIDManagerOpen")
                 raise OSError(f"IOHIDManagerOpen failed: 0x{res:08X}")
 
             devices = _iokit.IOHIDManagerCopyDevices(self._manager)

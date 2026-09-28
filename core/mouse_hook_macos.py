@@ -344,9 +344,9 @@ class MouseHook(BaseMouseHook):
             should_block = False
 
             # ── Per-button slide gestures (back/forward/middle) ──────────
-            # Motion while an owner button is held feeds the shared recognizer
-            # and is swallowed (return None) so the cursor freezes during the
-            # gesture. Fast None-check when no owner is armed.
+            # Never swallow cursor movement. HID button-up reports can be lost
+            # on disconnect/sleep; a stuck hold must not immobilize the Mac.
+            # We still sample motion for swipe/pan, but leave the OS pointer live.
             if (
                 self._button_gesture_active_owner is not None
                 and event_type in (
@@ -361,7 +361,7 @@ class MouseHook(BaseMouseHook):
                     cg_event, Quartz.kCGMouseEventDeltaY
                 )
                 self.sample_button_gesture(dx, dy, "os_motion")
-                return None
+                return cg_event
 
             if (
                 event_type
@@ -383,7 +383,7 @@ class MouseHook(BaseMouseHook):
                     f"Gesture move event type={int(event_type)} dx={dx} dy={dy}"
                 )
                 self._gesture_recognizer.sample(dx, dy, "event_tap")
-                return None
+                return cg_event
 
             if event_type == Quartz.kCGEventOtherMouseDown:
                 btn = Quartz.CGEventGetIntegerValueField(

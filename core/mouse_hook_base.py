@@ -705,6 +705,13 @@ class BaseMouseHook:
         self._set_device_connected(True)
 
     def _on_hid_disconnect(self):
+        # HID releases can disappear on unplug, sleep, or a radio hiccup.
+        # Never carry a held gesture into the next connection.
+        self.abort_button_gesture("hid_disconnect")
+        self._gesture_active = False
+        self._gesture_recognizer.end()
+        self._thumb_active = False
+        self._thumb_recognizer.end()
         self._connected_device = None
         self._set_device_connected(False)
 
