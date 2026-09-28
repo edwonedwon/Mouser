@@ -9,7 +9,7 @@ import threading
 import time
 
 from core.mouse_hook_base import BaseMouseHook, HidGestureListener
-from core.mouse_hook_types import MouseEvent
+from core.mouse_hook_types import MouseEvent, hscroll_event_type
 
 try:
     import objc
@@ -70,8 +70,10 @@ class MouseHook(BaseMouseHook):
         self._tap_source = None
         self.ignore_trackpad = True
         self._wake_observer = None
+        self._screens_wake_observer = None
         self._session_resign_observer = None
         self._session_activate_observer = None
+        self._last_resume_at = 0.0
         self._init_dispatch_queue(maxsize=512)
         self._dispatch_thread = None
         self._first_event_logged = False
@@ -281,9 +283,18 @@ class MouseHook(BaseMouseHook):
         while self._running:
             try:
                 event = self._dispatch_queue.get(timeout=0.05)
-                self._dispatch(event)
             except queue.Empty:
                 continue
+            # Action execution downstream of _dispatch creates Quartz
+            # CGEvent / NSEvent objects (key_simulator). This worker runs on
+            # its own thread, which has no NSAutoreleasePool, so without an
+            # explicit pool every autoreleased Foundation temporary produced
+            # while injecting a keystroke or mouse click leaks for the process
+            # lifetime -- the memory-growth-per-click reported in #233. The
+            # CGEventTap callback is already wrapped (@_autoreleased); this
+            # covers the second thread that touches Foundation objects.
+            with objc.autorelease_pool():
+                self._dispatch(event)
 
     @_autoreleased
     def _event_tap_callback(self, proxy, event_type, cg_event, refcon):
@@ -471,13 +482,10 @@ class MouseHook(BaseMouseHook):
                         )
                         if v_fixed != 0 and self._post_shift_hscroll_event(cg_event):
                             return None
-                if h_delta != 0:
-                    if h_delta > 0:
-                        mouse_event = MouseEvent(MouseEvent.HSCROLL_RIGHT, abs(h_delta))
-                        should_block = MouseEvent.HSCROLL_RIGHT in self._blocked_events
-                    else:
-                        mouse_event = MouseEvent(MouseEvent.HSCROLL_LEFT, abs(h_delta))
-                        should_block = MouseEvent.HSCROLL_LEFT in self._blocked_events
+                event_type = hscroll_event_type(h_delta)
+                if event_type:
+                    mouse_event = MouseEvent(event_type, abs(h_delta))
+                    should_block = event_type in self._blocked_events
                 if mouse_event:
                     self._enqueue_dispatch_event(mouse_event)
                     mouse_event = None
@@ -514,6 +522,40 @@ class MouseHook(BaseMouseHook):
         self._emit_debug("HID DPI switch button up")
         self._dispatch(MouseEvent(MouseEvent.DPI_SWITCH_UP))
 
+    # Give the macOS HID stack a moment to return, then replace the stale
+    # pre-sleep handle once. HidGestureListener owns all subsequent retries;
+    # queueing more force requests while it reconnects would tear down each
+    # fresh connection as soon as it opens.
+    _RESUME_RECONNECT_DELAY_S = 0.5
+    _RESUME_DEDUPE_S = 5.0
+
+    def _start_resume_recovery(self, reason):
+        # A full wake commonly raises both system-wake and screens-wake.
+        # Collapse that burst into one recovery pass.
+        now = time.monotonic()
+        if now - self._last_resume_at < self._RESUME_DEDUPE_S:
+            return False
+        self._last_resume_at = now
+        print(f"[MouseHook] Resume detected ({reason}) — recovering")
+        threading.Thread(
+            target=self._resume_recovery_worker,
+            daemon=True,
+            name="MouseHook-resume",
+        ).start()
+        return True
+
+    def _resume_recovery_worker(self):
+        time.sleep(self._RESUME_RECONNECT_DELAY_S)
+        if not self._running or not self._device_connected:
+            return
+        hg = self._hid_gesture
+        if hg is None:
+            return
+        try:
+            hg.force_reconnect()
+        except Exception as exc:
+            print(f"[MouseHook] resume reconnect request failed: {exc}")
+
     def _register_wake_observer(self):
         try:
             from AppKit import NSWorkspace
@@ -522,12 +564,10 @@ class MouseHook(BaseMouseHook):
         notification_center = NSWorkspace.sharedWorkspace().notificationCenter()
         hg = self._hid_gesture
 
-        def _re_enable_tap_and_reconnect(reason):
-            # Do not merely call CGEventTapEnable here.  macOS can leave the
-            # old tap reporting as enabled while its mach port is no longer
-            # attached to the input session, which is the characteristic
-            # post-sleep failure (pan sees no motion and button shortcuts stop
-            # dispatching).
+        def _re_enable_tap_and_reconnect(reason, reconnect=True):
+            # Recreate rather than merely re-enable: after sleep or a login
+            # round-trip the old tap can report enabled yet deliver no events.
+            ok = False
             if self._running:
                 with self._tap_recovery_lock:
                     self.abort_button_gesture(reason)
@@ -540,15 +580,17 @@ class MouseHook(BaseMouseHook):
                     flush=True,
                 )
                 if not ok:
-                    # The wake notification can precede Accessibility and the
-                    # per-user event session becoming ready.  Retry rather than
-                    # leaving the app running with a permanently dead tap.
                     self._schedule_tap_recovery(reason)
-            if hg:
+            if hg and reconnect:
                 hg.force_reconnect()
 
         def _on_wake(notification):
-            _re_enable_tap_and_reconnect("wake")
+            _re_enable_tap_and_reconnect("wake", reconnect=False)
+            self._start_resume_recovery("system wake")
+
+        def _on_screens_wake(notification):
+            _re_enable_tap_and_reconnect("screens wake", reconnect=False)
+            self._start_resume_recovery("screens wake")
 
         def _on_session_resign(notification):
             print("[MouseHook] Session deactivated", flush=True)
@@ -561,6 +603,12 @@ class MouseHook(BaseMouseHook):
             None,
             None,
             _on_wake,
+        )
+        self._screens_wake_observer = notification_center.addObserverForName_object_queue_usingBlock_(
+            "NSWorkspaceScreensDidWakeNotification",
+            None,
+            None,
+            _on_screens_wake,
         )
         self._session_resign_observer = (
             notification_center.addObserverForName_object_queue_usingBlock_(
@@ -626,6 +674,7 @@ class MouseHook(BaseMouseHook):
             notification_center = NSWorkspace.sharedWorkspace().notificationCenter()
             for attr in (
                 "_wake_observer",
+                "_screens_wake_observer",
                 "_session_resign_observer",
                 "_session_activate_observer",
             ):

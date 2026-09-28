@@ -115,9 +115,11 @@ The arrows match the runtime call graph: the OS-level mouse hook feeds events in
 Mouser exposes a single `MouseHook` façade in [`core/mouse_hook.py`](core/mouse_hook.py) and dispatches to a per-platform implementation:
 
 - **Windows** — [`core/mouse_hook_windows.py`](core/mouse_hook_windows.py): `SetWindowsHookExW` with `WH_MOUSE_LL` on a dedicated background thread, plus Raw Input for extra mouse data.
-- **macOS** — [`core/mouse_hook_macos.py`](core/mouse_hook_macos.py): `CGEventTap` for interception and Quartz events for key simulation. The callback is wrapped with `@_autoreleased` to recycle Foundation objects every event (closing a ~1.4 GB leak that appeared under load) and the tap auto re-enables itself when the system disables it on timeout.
+- **macOS** — [`core/mouse_hook_macos.py`](core/mouse_hook_macos.py): `CGEventTap` for interception and Quartz events for key simulation. The tap callback is wrapped with `@_autoreleased` to recycle Foundation objects every event (closing a ~1.4 GB leak that appeared under load) and the tap auto re-enables itself when the system disables it on timeout. Because action *execution* runs on other pool-less threads (the mouse-hook dispatch worker, the HID gesture thread, and the safety-release timers), the dispatch worker also wraps `_dispatch` in an autorelease pool and the [`core/key_simulator.py`](core/key_simulator.py) injection entry points are `@_autoreleased` too — otherwise the `CGEvent`/`NSEvent` objects created per click leak for the process lifetime (issue #233).
 - **Linux** — [`core/mouse_hook_linux.py`](core/mouse_hook_linux.py): `evdev` to grab the physical mouse and `uinput` to forward pass-through events through a virtual device.
 - **Stub** — [`core/mouse_hook_stub.py`](core/mouse_hook_stub.py): inert hook for unsupported platforms / smoke tests.
+
+Horizontal-scroll direction is decided once, in `hscroll_event_type()` ([`core/mouse_hook_types.py`](core/mouse_hook_types.py)): a positive delta is a rightward tilt on all three platforms. Each hook used to spell the comparison out itself, and Windows had it inverted for months — a wheel tilted right fired the left binding (issue #253).
 
 The shared base + types live in [`core/mouse_hook_base.py`](core/mouse_hook_base.py), [`core/mouse_hook_contract.py`](core/mouse_hook_contract.py), and [`core/mouse_hook_types.py`](core/mouse_hook_types.py).
 
@@ -162,7 +164,7 @@ The same module owns the SmartShift integration. It prefers the enhanced feature
 
 [`core/app_detector.py`](core/app_detector.py) polls the foreground window every 300ms.
 
-- **Windows:** `GetForegroundWindow` → `GetWindowThreadProcessId` → process name. UWP apps are resolved via `ApplicationFrameHost.exe` to the actual child process.
+- **Windows:** `GetForegroundWindow` → `GetWindowThreadProcessId` → process name. UWP apps are resolved via `ApplicationFrameHost.exe` to the actual child process. That resolution enumerates every top-level window and opens each owning process, so `classify_explorer_window()` triages `explorer.exe` windows first: real Explorer surfaces are the app, transient shell windows (taskbar previews, Alt-Tab, context menus) are skipped outright, and any other window is resolved at most once — its handle and class are memoised when nothing is found behind it. Without that triage a context menu or taskbar preview held the foreground and re-ran the full scan three times a second, starving the mouse hook (issue #252).
 - **macOS:** `NSWorkspace.frontmostApplication`.
 - **Linux:** `xdotool` (X11) and `kdotool` (KDE Wayland). Other Wayland compositors fall back to the default profile.
 
@@ -200,6 +202,15 @@ Two pages accessible from a slim sidebar in [`ui/qml/Main.qml`](ui/qml/Main.qml)
 - **Right panel** — device-aware mouse view. MX Master and MX Anywhere family devices get clickable hotspot dots on the image; unsupported layouts fall back to a generic device card with an experimental "try another supported map" picker.
 - **Add profile** — combo box at the bottom lists known apps (Chrome, Edge, VS Code, VLC, etc.). Click `+` to create a per-app profile.
 
+### Custom shortcut recorder
+
+[`ui/qml/KeyCaptureDialog.qml`](ui/qml/KeyCaptureDialog.qml) has two deliberately separate input modes:
+
+- **Record keys** (default) — the field is read-only and every key press becomes the shortcut. Held modifiers show as a `Ctrl + …` hint until a non-modifier key lands.
+- **Type instead** — a plain text field, so shifted characters such as `+` can be typed without the Shift press replacing the shortcut being written.
+
+On Windows the Super key can't be recorded through Qt alone: the shell acts on the `LWIN`/`RWIN` key-up, so pressing it opens the Start menu and takes focus away from the dialog. While recording, [`core/key_capture.py`](core/key_capture.py) installs a `WH_KEYBOARD_LL` hook that swallows *only* those two virtual keys (injected events are always passed through, so mouse-fired shortcuts keep working) and reports their pressed state to the backend, which folds it into the recorded combo as `Qt.MetaModifier`. The guard is released when the dialog closes, when the mode switches to typing, when the app loses focus, and on `aboutToQuit` — a leaked hook could otherwise swallow the Windows key app-wide. Every other platform gets a no-op guard.
+
 ### Point & scroll
 
 - **DPI slider** — 200 to the device max with quick presets (400, 800, 1000, 1600, 2400, 4000, 6000, 8000). Reads the current DPI from the device on startup.
@@ -234,6 +245,7 @@ mouser/
 │   ├── device_layouts.py        # Device-family layout registry for QML overlays
 │   ├── engine.py                # Core engine — wires hook ↔ simulator ↔ config
 │   ├── hid_gesture.py           # HID++ 2.0 gesture button + SmartShift (0x2110/0x2111)
+│   ├── key_capture.py           # Windows-key guard for the shortcut recorder
 │   ├── key_simulator.py         # Platform-specific action simulator
 │   ├── linux_permissions.py     # hidraw / event / uinput permission report
 │   ├── log_setup.py             # Rotating file log + stdout redirection
@@ -258,7 +270,7 @@ mouser/
 │       ├── Main.qml             # App shell (sidebar + page stack + tray toast)
 │       ├── MousePage.qml        # Merged mouse diagram + profile manager
 │       ├── ScrollPage.qml       # DPI slider + scroll/SmartShift toggles
-│       ├── KeyCaptureDialog.qml # Custom shortcut recorder
+│       ├── KeyCaptureDialog.qml # Custom shortcut recorder (record / type modes)
 │       ├── HotspotDot.qml       # Interactive button overlay on mouse image
 │       ├── ActionChip.qml       # Selectable action pill
 │       ├── AppIcon.qml          # File-icon helper for known apps

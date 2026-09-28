@@ -12,6 +12,7 @@ Falls back gracefully if the package or device are unavailable.
 """
 
 import atexit
+import functools
 import os
 import stat
 import sys
@@ -172,6 +173,15 @@ def _candidate_signature(info) -> dict:
     }
 
 
+def _candidate_cooldown_key(info) -> tuple:
+    """Hashable interface identity for the REPROG_V4-absent cooldown map."""
+    sig = _candidate_signature(info)
+    return (
+        sig["pid"], sig["usage_page"], sig["usage"],
+        sig["transport"], sig["source"], sig["path"],
+    )
+
+
 def _candidate_match_score(info, cached_candidate) -> int:
     """Ranking score for a candidate against the cached identity tuple.
     0 = no match, 1 = PID+usage match, 2 = +same source backend,
@@ -220,6 +230,21 @@ def _register_atexit_listener(listener):
         if not _ATEXIT_REGISTERED:
             atexit.register(_atexit_stop_listeners)
             _ATEXIT_REGISTERED = True
+
+
+def _wheel_mode_display(mode):
+    """Render a 0x2121 wheel-mode byte for logs, so a future #244-style
+    report can be diagnosed from the log alone."""
+    if mode is None:
+        return "unknown"
+    flags = []
+    if mode & 0x01:
+        flags.append("divert")
+    if mode & 0x02:
+        flags.append("hi-res")
+    if mode & 0x04:
+        flags.append("invert")
+    return f"0x{mode:02X}({'+'.join(flags) or 'none'})"
 
 
 def _log_once(key, message):
@@ -336,6 +361,8 @@ if sys.platform == "darwin":
         _iokit.IOHIDManagerSetDeviceMatching.argtypes = [c_void_p, c_void_p]
         _iokit.IOHIDManagerOpen.argtypes = [c_void_p, c_int]
         _iokit.IOHIDManagerOpen.restype = c_int
+        _iokit.IOHIDManagerClose.argtypes = [c_void_p, c_int]
+        _iokit.IOHIDManagerClose.restype = c_int
         _iokit.IOHIDManagerCopyDevices.argtypes = [c_void_p]
         _iokit.IOHIDManagerCopyDevices.restype = c_void_p
 
@@ -374,6 +401,51 @@ if sys.platform == "darwin":
         _K_IOHID_REPORT_TYPE_INPUT = 0
         _K_IOHID_REPORT_TYPE_OUTPUT = 1
         _K_CF_RUN_LOOP_DEFAULT_MODE = c_void_p.in_dll(_cf, "kCFRunLoopDefaultMode")
+
+        # NSAutoreleasePool via libobjc: the IOHID paths below run on plain
+        # Python threads (HID listener, reconnect loop, battery/smart-shift
+        # pollers) that never drain an autorelease pool, so autoreleased
+        # Foundation/IOKit temporaries — most visibly the HIDEvent objects
+        # produced while CFRunLoopRunInMode delivers input reports — would
+        # otherwise accumulate for the process lifetime (#233, #238).
+        try:
+            _objc_rt = ctypes.CDLL("/usr/lib/libobjc.A.dylib")
+            _objc_rt.objc_getClass.argtypes = [c_char_p]
+            _objc_rt.objc_getClass.restype = c_void_p
+            _objc_rt.sel_registerName.argtypes = [c_char_p]
+            _objc_rt.sel_registerName.restype = c_void_p
+            _objc_rt.objc_msgSend.argtypes = [c_void_p, c_void_p]
+            _objc_rt.objc_msgSend.restype = c_void_p
+            _NS_POOL_CLASS = _objc_rt.objc_getClass(b"NSAutoreleasePool")
+            _SEL_NEW = _objc_rt.sel_registerName(b"new")
+            _SEL_DRAIN = _objc_rt.sel_registerName(b"drain")
+            _OBJC_POOL_OK = bool(_NS_POOL_CLASS and _SEL_NEW and _SEL_DRAIN)
+        except Exception as _pool_exc:
+            print(f"[HidGesture] NSAutoreleasePool unavailable: {_pool_exc}")
+            _OBJC_POOL_OK = False
+
+        class _AutoreleasePool:
+            __slots__ = ("_pool",)
+
+            def __enter__(self):
+                self._pool = (
+                    _objc_rt.objc_msgSend(_NS_POOL_CLASS, _SEL_NEW)
+                    if _OBJC_POOL_OK else None
+                )
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                pool, self._pool = self._pool, None
+                if pool:
+                    _objc_rt.objc_msgSend(pool, _SEL_DRAIN)
+                return False
+
+        def _pooled(fn):
+            @functools.wraps(fn)
+            def wrapper(*args, **kwargs):
+                with _AutoreleasePool():
+                    return fn(*args, **kwargs)
+            return wrapper
 
         _MAC_NATIVE_OK = True
     except Exception as exc:
@@ -462,7 +534,25 @@ if _MAC_NATIVE_OK:
             finally:
                 _cf.CFRelease(key)
 
+        @staticmethod
+        def _close_manager(manager):
+            """Balance IOHIDManagerOpen before releasing the CF wrapper.
+
+            IOHIDManagerClose releases the IOKit user-client (its Mach ports)
+            and the enclosed-device opens; a bare CFRelease does not, so the
+            manager object and roughly two Mach ports leak on every open. This
+            was the dominant leak in issue #238: tens of thousands of live
+            IOHIDManager objects after a day of reconnect churn."""
+            if not manager:
+                return
+            try:
+                _iokit.IOHIDManagerClose(manager, 0)
+            except Exception:
+                pass
+            _cf.CFRelease(manager)
+
         @classmethod
+        @_pooled
         def enumerate_infos(cls):
             infos = []
             manager = None
@@ -524,12 +614,25 @@ if _MAC_NATIVE_OK:
                 if matching:
                     _cf.CFRelease(matching)
                 if manager:
-                    _cf.CFRelease(manager)
+                    cls._close_manager(manager)
                 for item in matching_refs:
                     _cf.CFRelease(item)
             return infos
 
+        @_pooled
         def open(self):
+            """Exception-safe open. On any partial failure, release every
+            CoreFoundation object allocated so far so a failed open cannot
+            leak the manager, matching dict, matching refs, or the retained
+            device. ``close()`` is idempotent and guards each field, so a
+            failed open is safe to unwind through it (issue #238)."""
+            try:
+                self._open()
+            except Exception:
+                self.close()
+                raise
+
+        def _open(self):
             keys = [
                 self._cfstring("VendorID"),
                 self._cfstring("ProductID"),
@@ -604,6 +707,7 @@ if _MAC_NATIVE_OK:
                 parts.append(f'transport "{self._transport}"')
             return "No IOHIDDevice for " + " ".join(parts)
 
+        @_pooled
         def close(self):
             if self._device and self._run_loop:
                 try:
@@ -626,7 +730,7 @@ if _MAC_NATIVE_OK:
                 _cf.CFRelease(self._matching)
                 self._matching = None
             if self._manager:
-                _cf.CFRelease(self._manager)
+                self._close_manager(self._manager)
                 self._manager = None
             for item in self._matching_refs:
                 _cf.CFRelease(item)
@@ -639,6 +743,7 @@ if _MAC_NATIVE_OK:
         def set_nonblocking(self, _enabled):
             return None
 
+        @_pooled
         def write(self, buf):
             arr = (c_uint8 * len(buf))(*buf)
             res = _iokit.IOHIDDeviceSetReport(
@@ -682,17 +787,30 @@ if _MAC_NATIVE_OK:
                 else:
                     slice_seconds = 0.05
 
-                _cf.CFRunLoopRunInMode(
-                    _K_CF_RUN_LOOP_DEFAULT_MODE,
-                    slice_seconds,
-                    True,
-                )
+                # Pool per pump iteration: input-report callbacks fire inside
+                # this call, and their per-report temporaries must not outlive
+                # the slice.
+                with _AutoreleasePool():
+                    _cf.CFRunLoopRunInMode(
+                        _K_CF_RUN_LOOP_DEFAULT_MODE,
+                        slice_seconds,
+                        True,
+                    )
                 try:
                     return self._report_queue.get_nowait()
                 except queue.Empty:
                     if deadline is not None:
                         continue
                     return b""
+
+        def __del__(self):
+            # Backstop: an instance discarded without an explicit close() (for
+            # example a caller that drops a half-open device) must not leak
+            # IOKit resources. close() is idempotent; never raise from __del__.
+            try:
+                self.close()
+            except Exception:
+                pass
 
 # ── Constants ─────────────────────────────────────────────────────
 LOGI_VID       = 0x046D
@@ -910,6 +1028,12 @@ def _control_present(controls, cid: int) -> bool:
 class HidGestureListener:
     """Background thread: diverts the gesture button and listens via HID++."""
 
+    # Cooldown before an interface that opened but exposed no REPROG_V4 is
+    # re-probed, so a stable set of incompatible interfaces is not re-scanned
+    # every pass during a reconnect storm. Bypassed when it is the only
+    # candidate so a woken device reconnects promptly (issue #238).
+    _REPROG_ABSENT_COOLDOWN_S = 10.0
+
     def __init__(self, on_down=None, on_up=None, on_move=None,
                  on_connect=None, on_disconnect=None, extra_diverts=None,
                  on_wheel=None, on_thumbwheel=None,
@@ -993,6 +1117,8 @@ class HidGestureListener:
         self._smart_shift_slot_lock = threading.Lock()
         self._smart_shift_event = threading.Event()
         self._reconnect_requested = False
+        # signature -> monotonic deadline; see _REPROG_ABSENT_COOLDOWN_S.
+        self._reprog_absent_until = {}
         self._pending_battery = None
         self._battery_result = None
         self._battery_event = threading.Event()
@@ -1007,6 +1133,14 @@ class HidGestureListener:
         # pending/result slot. The event signals listener-loop completion.
         self._hires_wheel_idx = None
         self._hires_wheel_multiplier = None
+        # 0x2121 wheel mode as found at connect, before Mouser touches it.
+        # The resolution bit is owned by whoever set it up (on Linux the
+        # in-kernel hid-logitech-hidpp driver enables hi-res at probe and
+        # then divides wheel deltas by a latched multiplier), so we restore
+        # this exact byte on stop rather than assuming a default. None means
+        # "never read it", which is the only state in which we refuse to
+        # write bit2 at all.
+        self._hires_wheel_mode_initial = None
         self._thumbwheel_idx = None
         self._thumbwheel_multiplier = None
         self._wheel_divert_target = (False, False)
@@ -1055,15 +1189,20 @@ class HidGestureListener:
         return True
 
     def stop(self):
-        # Best-effort revert to native non-inverted before tearing down, so a
-        # graceful exit leaves the device in firmware default state. We log
+        # Best-effort revert before tearing down, so a graceful exit leaves the
+        # device exactly as we found it. We restore the wheel-mode byte captured
+        # at connect rather than writing a composed default: the resolution bit
+        # is not ours to choose, and guessing it is what broke #244. We log
         # failures rather than swallow them: a failed revert means the next
         # session will see an unexpected divert state and the user needs the
         # breadcrumb to debug it. We do not propagate -- ``stop`` must always
         # complete the rest of teardown (close device, join thread).
         if self._dev is not None and self._wheel_divert_state:
             try:
-                self._set_native_wheel_invert_vertical(False)
+                if self._hires_wheel_mode_initial is not None:
+                    self._write_wheel_mode(self._hires_wheel_mode_initial)
+                else:
+                    self._set_native_wheel_invert_vertical(False)
             except Exception as exc:  # noqa: BLE001 - teardown must complete
                 print(f"[HidGesture] stop: vertical invert revert failed: {exc}")
             try:
@@ -2071,37 +2210,86 @@ class HidGestureListener:
             self._finish_pending_smart_shift(None)
 
     # 0x2121 setWheelMode (fn 2) bitfield: bit0=target (0=HID, 1=divert),
-    # bit1=resolution (0=low, 1=hi-res), bit2=invert. Mouser keeps target
-    # and resolution at 0 and only drives bit2 -- hi-res emits fractional
-    # events per detent which renders as jumpy scroll on apps without
-    # trackpad-class smoothing.
+    # bit1=resolution (0=low, 1=hi-res), bit2=invert. Mouser drives *only*
+    # bit2 and preserves bits 0-1 as found: the resolution bit belongs to
+    # whoever configured the device (on Linux the kernel's
+    # hid-logitech-hidpp enables hi-res at probe and divides deltas by a
+    # latched multiplier). Composing an absolute byte here clobbers that and
+    # leaves scroll crawling until the mouse is power-cycled -- see #244.
     _WHEEL_MODE_BIT_TARGET     = 0x01
     _WHEEL_MODE_BIT_RESOLUTION = 0x02
     _WHEEL_MODE_BIT_INVERT     = 0x04
     # 0x2150 setThumbwheelReporting (fn 2): [reportingMode, invertDirection].
     _THUMBWHEEL_SET_REPORTING_FN = 2
 
+    def _read_wheel_mode(self):
+        """Return the current 0x2121 wheel mode byte, or None if it cannot
+        be read. Listener-thread only."""
+        if self._hires_wheel_idx is None or self._dev is None:
+            return None
+        resp = self._request(self._hires_wheel_idx, 1, [])
+        if resp is None:
+            return None
+        _, _, _, _, params = resp
+        if not params:
+            return None
+        return int(params[0]) & 0xFF
+
+    def _write_wheel_mode(self, mode: int) -> bool:
+        """Write an absolute 0x2121 wheel mode byte. Listener-thread only.
+        Callers must have composed `mode` from a freshly read value; see
+        ``_set_native_wheel_invert_vertical``."""
+        if self._hires_wheel_idx is None or self._dev is None:
+            return False
+        resp = self._request(self._hires_wheel_idx, 2, [mode & 0xFF])
+        return resp is not None
+
     def _set_native_wheel_invert_vertical(self, invert: bool) -> bool:
-        """Read-modify-write the 0x2121 wheel mode to native low-res with
-        the invert bit reflecting `invert`. Listener-thread only. Returns
-        True when the device acknowledges the write, or when the feature
-        is absent AND no inversion was requested -- claiming success for
-        an invert the firmware cannot perform would make the engine
+        """Flip only the invert bit (bit2) of the 0x2121 wheel mode, leaving
+        the target (bit0) and resolution (bit1) bits exactly as found.
+
+        This is a genuine read-modify-write: the previous implementation
+        composed an absolute byte (0x00 / 0x04) and so silently cleared the
+        resolution bit, forcing the wheel out of hi-res. On Linux the kernel
+        enables hi-res at probe and keeps dividing deltas by a latched
+        multiplier, so clearing it left scrolling ~8-15x too slow, and the
+        mode lives in device RAM, so it survived process exit and only
+        cleared on a power cycle (issue #244).
+
+        Listener-thread only. Returns True when the device acknowledges the
+        write, when the mode already matches (no write needed), or when the
+        feature is absent AND no inversion was requested. Claiming success
+        for an invert the firmware cannot perform would make the engine
         suppress the OS-layer fallback and lose the inversion entirely."""
         if self._hires_wheel_idx is None:
             return not invert
         if self._dev is None:
             return False
-        target_mode = self._WHEEL_MODE_BIT_INVERT if invert else 0x00
-        if invert:
-            current_resp = self._request(self._hires_wheel_idx, 1, [])
-            if current_resp is not None:
-                _, _, _, _, params = current_resp
-                current_mode = int(params[0]) & 0xFF if params else None
-                if current_mode == target_mode:
-                    return True
-        resp = self._request(self._hires_wheel_idx, 2, [target_mode])
-        return resp is not None
+        current_mode = self._read_wheel_mode()
+        if current_mode is None:
+            # Fall back to the byte captured at connect, so a transient read
+            # failure does not cost us the preserved resolution bit.
+            current_mode = self._hires_wheel_mode_initial
+        if current_mode is None:
+            # Never managed to read the mode. Writing a composed byte here
+            # would be the very guess that broke #244, so refuse: report
+            # success only when there is nothing to do, otherwise let the
+            # engine fall back to OS-layer inversion.
+            return not invert
+        # bit0 (target): always cleared. Mouser wants native HID reporting,
+        # and clearing it also recovers a device left diverted by a crashed
+        # session.
+        # bit2 (invert): the only bit we actually drive.
+        # Everything else -- bit1 (resolution) and any reserved bits -- is
+        # carried through untouched. Masking down to known bits is how #244
+        # happened, so clear exactly what we mean to clear and no more.
+        target_mode = (
+            current_mode
+            & ~(self._WHEEL_MODE_BIT_TARGET | self._WHEEL_MODE_BIT_INVERT)
+        ) | (self._WHEEL_MODE_BIT_INVERT if invert else 0x00)
+        if current_mode == target_mode:
+            return True
+        return self._write_wheel_mode(target_mode)
 
     def _set_native_wheel_invert_horizontal(self, invert: bool) -> bool:
         """Set firmware invert on the thumbwheel (0x2150 fn 2) without
@@ -2764,7 +2952,31 @@ class HidGestureListener:
                   f"usage=0x{usage:04X} transport={transport or '-'} "
                   f"source={source} product={product} path={path or '-'}")
 
+        # REPROG_V4-absent cooldown (issue #238): skip interfaces that recently
+        # opened but exposed no REPROG_V4, so a stable set of incompatible
+        # interfaces is not re-probed on every pass. Never skip when *all*
+        # candidates are cooling down, so a sole (e.g. just-woken) device is
+        # still probed; the connect backoff throttles that case instead.
+        now = time.monotonic()
+        self._reprog_absent_until = {
+            k: t for k, t in self._reprog_absent_until.items() if t > now
+        }
+        cooled = {
+            _candidate_cooldown_key(info)
+            for info in infos
+            if _candidate_cooldown_key(info) in self._reprog_absent_until
+        }
+        skip_cooled = bool(cooled) and len(cooled) < len(infos)
+
         for info in infos:
+            cand_key = _candidate_cooldown_key(info)
+            if skip_cooled and cand_key in cooled:
+                print(
+                    "[HidGesture] Skipping recently-incompatible interface "
+                    f"PID=0x{int(info.get('product_id', 0) or 0):04X} "
+                    "(no REPROG_V4; cooling down)"
+                )
+                continue
             pid = info.get("product_id", 0)
             up = info.get("usage_page", 0)
             usage = info.get("usage", 0)
@@ -2796,6 +3008,7 @@ class HidGestureListener:
             self._rawxy_enabled = False
             self._hires_wheel_idx = None
             self._hires_wheel_multiplier = None
+            self._hires_wheel_mode_initial = None
             self._thumbwheel_idx = None
             self._thumbwheel_multiplier = None
             self._wheel_divert_state = False
@@ -3034,9 +3247,11 @@ class HidGestureListener:
                             self._hires_wheel_multiplier = (
                                 int(mul) if mul not in (None, 0) else None
                             )
+                        self._hires_wheel_mode_initial = self._read_wheel_mode()
                         print(
                             f"[HidGesture] HIRES_WHEEL_ENHANCED @0x{hw_fi:02X} "
-                            f"mul={self._hires_wheel_multiplier}"
+                            f"mul={self._hires_wheel_multiplier} "
+                            f"mode={_wheel_mode_display(self._hires_wheel_mode_initial)}"
                         )
                     tw_fi = self._wheel_feature_indexes.get(FEAT_THUMB_WHEEL)
                     if tw_fi:
@@ -3114,6 +3329,7 @@ class HidGestureListener:
                             )
                         except Exception as exc:
                             print(f"[HidGesture] Cache write skipped: {exc}")
+                        self._reprog_absent_until.pop(cand_key, None)
                         return True
                     continue     # divert failed -- try next receiver slot
             if not reprog_found:
@@ -3122,6 +3338,9 @@ class HidGestureListener:
                     f"on tested devIdx values PID=0x{int(pid or 0):04X} "
                     f"UP=0x{opened_up:04X} usage=0x{opened_usage:04X} "
                     f"transport={opened_transport or '-'} source={source}"
+                )
+                self._reprog_absent_until[cand_key] = (
+                    time.monotonic() + self._REPROG_ABSENT_COOLDOWN_S
                 )
 
             # Couldn't use this interface -- close and try next
@@ -3133,20 +3352,40 @@ class HidGestureListener:
 
         return False
 
+    def _interruptible_sleep(self, seconds):
+        """Sleep up to ``seconds`` in 0.1 s slices, returning early if the
+        listener has been stopped so teardown stays responsive."""
+        for _ in range(int(max(0.0, seconds) / 0.1)):
+            if not self._running:
+                return
+            time.sleep(0.1)
+
     def _main_loop(self):
         """Outer loop: connect → listen → reconnect on error/disconnect."""
         retry_logged = False
+        # Backoff for repeated failed connects. A sleeping or unreachable BLE
+        # mouse can stay enumerable while every open+probe fails; a flat 1.5 s
+        # retry then re-enumerates constantly, which on macOS also multiplies
+        # the per-attempt IOKit work (issue #238). Grow 1.5 s to 30 s on
+        # consecutive failures; reset on any successful connect.
+        _CONNECT_BACKOFF_BASE_S = 1.5
+        _CONNECT_BACKOFF_MAX_S = 30.0
+        connect_backoff_s = _CONNECT_BACKOFF_BASE_S
         while self._running:
             if not self._try_connect():
                 if not retry_logged:
-                    print("[HidGesture] No compatible device; retrying in 1.5 s…")
+                    print(
+                        "[HidGesture] No compatible device; retrying with "
+                        f"backoff up to {_CONNECT_BACKOFF_MAX_S:.0f} s…"
+                    )
                     retry_logged = True
-                for _ in range(15):
-                    if not self._running:
-                        return
-                    time.sleep(0.1)
+                self._interruptible_sleep(connect_backoff_s)
+                connect_backoff_s = min(
+                    connect_backoff_s * 2, _CONNECT_BACKOFF_MAX_S
+                )
                 continue
             retry_logged = False
+            connect_backoff_s = _CONNECT_BACKOFF_BASE_S
 
             self._connected = True
             if self._on_connect:
@@ -3298,4 +3537,4 @@ class HidGestureListener:
                         pass
 
             if self._running:
-                time.sleep(2)
+                self._interruptible_sleep(2)
