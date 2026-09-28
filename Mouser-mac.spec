@@ -13,6 +13,8 @@ import os
 import json
 import subprocess
 
+from PyInstaller.utils.hooks import collect_dynamic_libs
+
 ROOT = os.path.abspath(".")
 COMMITTED_ICON = os.path.join(ROOT, "images", "AppIcon.icns")
 GENERATED_ICON = os.path.join(ROOT, "build", "macos", "Mouser.icns")
@@ -92,10 +94,15 @@ def _write_build_info(version: str) -> str:
 APP_VERSION = _load_app_version()
 BUILD_INFO_DATA = _write_build_info(APP_VERSION)
 
+# hidapi is a compiled extension on macOS. Explicitly collect any companion
+# dylibs as well as the extension itself; this is needed for the packaged app
+# even though source launches can import hidapi directly from the venv.
+HIDAPI_BINARIES = collect_dynamic_libs("hid")
+
 a = Analysis(
     ["main_qml.py"],
     pathex=[ROOT],
-    binaries=[],
+    binaries=HIDAPI_BINARIES,
     datas=[
         (os.path.join(ROOT, "ui", "qml"), os.path.join("ui", "qml")),
         (os.path.join(ROOT, "images"), "images"),

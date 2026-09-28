@@ -75,6 +75,13 @@ class MouseHook(BaseMouseHook):
         self._init_dispatch_queue(maxsize=512)
         self._dispatch_thread = None
         self._first_event_logged = False
+        # Wake/session notifications can arrive more than once (and sometimes
+        # arrive concurrently while macOS is rebuilding the input session).
+        # Serialize tap replacement so an old recovery cannot invalidate a new
+        # tap.  A failed create is retried because Accessibility/event taps are
+        # commonly unavailable for a short window during login wake.
+        self._tap_recovery_lock = threading.Lock()
+        self._tap_recovery_timer = None
 
     def _negate_scroll_axis(self, cg_event, axis):
         for field_name in (
@@ -516,19 +523,27 @@ class MouseHook(BaseMouseHook):
         hg = self._hid_gesture
 
         def _re_enable_tap_and_reconnect(reason):
-            if self._tap and self._running:
-                # Recreate rather than re-enable: after sleep or a login
-                # round-trip the old tap can report enabled yet deliver no
-                # events. HID-diverted buttons keep working, but pan (which
-                # needs mouse-moved events from the tap) goes dead.
-                self.abort_button_gesture(reason)
-                self._remove_tap()
-                ok = self._install_tap()
+            # Do not merely call CGEventTapEnable here.  macOS can leave the
+            # old tap reporting as enabled while its mach port is no longer
+            # attached to the input session, which is the characteristic
+            # post-sleep failure (pan sees no motion and button shortcuts stop
+            # dispatching).
+            if self._running:
+                with self._tap_recovery_lock:
+                    self.abort_button_gesture(reason)
+                    self._remove_tap()
+                    ok = self._install_tap()
+                    self._first_event_logged = False
                 print(
                     f"[MouseHook] Event tap recreated ({reason}): "
-                    f"{'OK' if ok else 'FAILED — may need restart'}",
+                    f"{'OK' if ok else 'FAILED'}",
                     flush=True,
                 )
+                if not ok:
+                    # The wake notification can precede Accessibility and the
+                    # per-user event session becoming ready.  Retry rather than
+                    # leaving the app running with a permanently dead tap.
+                    self._schedule_tap_recovery(reason)
             if hg:
                 hg.force_reconnect()
 
@@ -563,6 +578,46 @@ class MouseHook(BaseMouseHook):
                 _on_session_activate,
             )
         )
+
+    def _schedule_tap_recovery(self, reason, delay=0.5):
+        """Retry tap installation after a transient wake/login failure."""
+        if not self._running:
+            return
+        with self._tap_recovery_lock:
+            if self._tap_recovery_timer is not None:
+                return
+            timer = threading.Timer(
+                delay,
+                self._retry_tap_recovery,
+                args=(reason,),
+            )
+            timer.daemon = True
+            self._tap_recovery_timer = timer
+            timer.start()
+
+    def _retry_tap_recovery(self, reason):
+        with self._tap_recovery_lock:
+            self._tap_recovery_timer = None
+        if not self._running or self._tap is not None:
+            return
+        # Reuse the same serialized path as workspace notifications.  A
+        # second attempt is enough for the normal wake race; future wake
+        # notifications will trigger another attempt if the session vanishes.
+        if not self._register_tap_after_wake(reason):
+            self._schedule_tap_recovery(reason, delay=1.5)
+
+    def _register_tap_after_wake(self, reason):
+        if not self._running:
+            return False
+        with self._tap_recovery_lock:
+            if self._tap is not None:
+                return True
+            ok = self._install_tap()
+            if ok:
+                self._first_event_logged = False
+        if not ok:
+            print(f"[MouseHook] Event tap recovery failed ({reason})", flush=True)
+        return ok
 
     def _unregister_wake_observer(self):
         try:
@@ -657,6 +712,10 @@ class MouseHook(BaseMouseHook):
     def stop(self):
         self._unregister_wake_observer()
         self._running = False
+        recovery_timer = self._tap_recovery_timer
+        self._tap_recovery_timer = None
+        if recovery_timer is not None:
+            recovery_timer.cancel()
         self.abort_button_gesture("stop")
         self._stop_hid_listener()
         self._connected_device = None

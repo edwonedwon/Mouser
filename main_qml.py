@@ -532,9 +532,10 @@ else:
 class _MacOSQuitToTrayFilter(QObject):
     """Intercept app-level quit requests and hide the window instead."""
 
-    def __init__(self, root_window, parent=None):
+    def __init__(self, root_window, parent=None, show_window=None):
         super().__init__(parent)
         self._root_window = root_window
+        self._show_window = show_window
         self._allow_quit = False
 
     def allow_quit(self) -> None:
@@ -544,7 +545,18 @@ class _MacOSQuitToTrayFilter(QObject):
         if self._allow_quit:
             return False
         try:
-            if event.type() != QEvent.Type.Quit:
+            event_type = event.type()
+            # Finder/Spotlight may activate an already-running LSUIElement
+            # process without starting a second process. Treat that activation
+            # as the user's request to reopen Settings when the window is
+            # hidden. The single-instance socket remains the normal path when
+            # LaunchServices starts a second process.
+            if (event_type == QEvent.Type.ApplicationActivate
+                    and self._show_window is not None
+                    and self._root_window.visibility() == QWindow.Visibility.Hidden):
+                QTimer.singleShot(0, self._show_window)
+                return False
+            if event_type != QEvent.Type.Quit:
                 return False
             if _macos_current_quit_is_system_session_event():
                 self.allow_quit()
@@ -1220,7 +1232,9 @@ def main():
     _on_window_visibility_changed(root_window.visibility())
     if sys.platform == "darwin":
         global _MACOS_QUIT_FILTER
-        _MACOS_QUIT_FILTER = _MacOSQuitToTrayFilter(root_window, app)
+        _MACOS_QUIT_FILTER = _MacOSQuitToTrayFilter(
+            root_window, app, show_window=show_main_window
+        )
         app.installEventFilter(_MACOS_QUIT_FILTER)
         app.commitDataRequest.connect(
             lambda *_: _allow_macos_session_quit_if_requested(_MACOS_QUIT_FILTER)
