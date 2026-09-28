@@ -30,6 +30,19 @@ class SingleInstanceServerNameTests(unittest.TestCase):
         self.assertTrue(a.startswith("mouser_instance_"))
         self.assertEqual(len(a), len("mouser_instance_") + 16)
 
+    def test_source_and_bundle_names_are_isolated(self):
+        with (
+            patch.object(main_qml.getpass, "getuser", return_value="testuser"),
+            patch.object(main_qml.sys, "frozen", False, create=True),
+        ):
+            source_name = main_qml._single_instance_server_name()
+        with (
+            patch.object(main_qml.getpass, "getuser", return_value="testuser"),
+            patch.object(main_qml.sys, "frozen", True, create=True),
+        ):
+            bundle_name = main_qml._single_instance_server_name()
+        self.assertNotEqual(source_name, bundle_name)
+
 
 @unittest.skipIf(main_qml is None, "main_qml / PySide6 not available")
 class TryActivateExistingTests(unittest.TestCase):

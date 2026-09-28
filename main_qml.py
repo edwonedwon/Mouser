@@ -118,7 +118,12 @@ _SINGLE_INSTANCE_ACTIVATE_MSG = b"show"
 
 
 def _single_instance_server_name() -> str:
-    raw = f"{getpass.getuser()}\0{sys.platform}"
+    # Keep source-checkout and packaged-app instances separate. Otherwise an
+    # old `make dev` process (whose permissions belong to Terminal/Python) can
+    # capture an Applications-folder launch of Mouser and make the packaged
+    # app appear to be the process requesting access.
+    launch_kind = "bundle" if getattr(sys, "frozen", False) else "source"
+    raw = f"{getpass.getuser()}\0{sys.platform}\0{launch_kind}"
     digest = hashlib.sha256(raw.encode("utf-8", errors="replace")).hexdigest()[:16]
     return f"mouser_instance_{digest}"
 
