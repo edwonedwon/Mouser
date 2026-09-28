@@ -52,8 +52,8 @@ def _program_arguments():
     """Argv list for macOS LaunchAgent ProgramArguments."""
     exe = os.path.abspath(sys.executable)
     if getattr(sys, "frozen", False):
-        return [exe]
-    return [exe, os.path.abspath(sys.argv[0])]
+        return [exe, "--start-hidden"]
+    return [exe, os.path.abspath(sys.argv[0]), "--start-hidden"]
 
 
 def _runtime_root_dir() -> str:
@@ -437,9 +437,14 @@ def _apply_macos(enabled: bool) -> None:
 
     if enabled:
         os.makedirs(launch_agents_dir, exist_ok=True)
-        plist_existed = os.path.isfile(plist_path)
+        payload = {
+            "Label": MACOS_LAUNCH_AGENT_LABEL,
+            "ProgramArguments": _program_arguments(),
+            "RunAtLoad": True,
+        }
+        new_plist = plistlib.dumps(payload, fmt=plistlib.FMT_XML)
         previous_plist = None
-        if plist_existed:
+        if os.path.isfile(plist_path):
             try:
                 with open(plist_path, "rb") as f:
                     previous_plist = f.read()
@@ -447,13 +452,11 @@ def _apply_macos(enabled: bool) -> None:
                 raise RuntimeError(
                     f"failed to preserve existing launch agent: {exc}"
                 ) from exc
+            # Backend syncs this on every launch. Booting out an unchanged
+            # agent can kill the very login process that is starting now.
+            if previous_plist == new_plist:
+                return
             _launchctl_run(["launchctl", "bootout", domain, plist_path])
-        payload = {
-            "Label": MACOS_LAUNCH_AGENT_LABEL,
-            "ProgramArguments": _program_arguments(),
-            "RunAtLoad": True,
-        }
-        new_plist = plistlib.dumps(payload, fmt=plistlib.FMT_XML)
         try:
             _atomic_write_file(plist_path, new_plist)
             result = _launchctl_run(["launchctl", "bootstrap", domain, plist_path])

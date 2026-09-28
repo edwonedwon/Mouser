@@ -454,6 +454,46 @@ class MacOSQuitAndAccessibilityTests(unittest.TestCase):
         root_window.hide.assert_called_once()
         event.ignore.assert_called_once()
 
+    def test_hidden_login_ignores_initial_automatic_activation(self):
+        root_window = MagicMock()
+        root_window.visibility.return_value = main_qml.QWindow.Visibility.Hidden
+        show = MagicMock()
+        event = MagicMock()
+        event.type.return_value = main_qml.QEvent.Type.ApplicationActivate
+        event_filter = main_qml._MacOSQuitToTrayFilter(
+            root_window, show_window=show, startup_hidden=True
+        )
+        with patch.object(main_qml.QTimer, "singleShot") as schedule:
+            self.assertFalse(event_filter.eventFilter(None, event))
+            schedule.assert_not_called()
+            self.assertFalse(event_filter.eventFilter(None, event))
+            schedule.assert_called_once_with(0, show)
+
+    def test_privacy_setup_quit_does_not_hide_window(self):
+        root_window = MagicMock()
+        event = MagicMock()
+        event.type.return_value = main_qml.QEvent.Type.Quit
+        event_filter = main_qml._MacOSQuitToTrayFilter(root_window)
+        event_filter.set_permission_setup_pending(True)
+
+        self.assertTrue(event_filter.eventFilter(None, event))
+        root_window.hide.assert_not_called()
+        event.ignore.assert_called_once()
+
+        event_filter.set_permission_setup_pending(False)
+        self.assertTrue(event_filter.eventFilter(None, event))
+        root_window.hide.assert_called_once()
+
+    def test_privacy_setup_still_allows_explicit_tray_quit(self):
+        root_window = MagicMock()
+        event = MagicMock()
+        event.type.return_value = main_qml.QEvent.Type.Quit
+        event_filter = main_qml._MacOSQuitToTrayFilter(root_window)
+        event_filter.set_permission_setup_pending(True)
+        event_filter.allow_quit()
+        self.assertFalse(event_filter.eventFilter(None, event))
+        root_window.hide.assert_not_called()
+
     def test_quit_filter_allows_explicit_tray_quit(self):
         root_window = MagicMock()
         event = MagicMock()
@@ -527,6 +567,22 @@ class MacOSQuitAndAccessibilityTests(unittest.TestCase):
         single_shot.assert_not_called()
         engine.start.assert_not_called()
 
+    def test_poll_clears_permission_setup_when_granted(self):
+        engine = MagicMock()
+        on_granted = MagicMock()
+        with (
+            patch.object(main_qml.QTimer, "singleShot"),
+            patch.object(main_qml.QTimer, "start"),
+            patch.object(main_qml, "is_process_trusted", return_value=True),
+        ):
+            main_qml._schedule_engine_start(
+                engine, accessibility_granted=False,
+                on_accessibility_granted=on_granted,
+            )
+            engine._accessibility_poll_timer.timeout.emit()
+        on_granted.assert_called_once_with()
+        engine.start.assert_called_once_with()
+
     def test_engine_start_schedules_when_accessibility_is_granted(self):
         engine = MagicMock()
 
@@ -542,6 +598,15 @@ class MacOSQuitAndAccessibilityTests(unittest.TestCase):
 
         callback()
         engine.start.assert_called_once()
+
+    def test_hidden_login_checks_permission_without_native_prompt(self):
+        locale_mgr = SimpleNamespace(tr=lambda key: key)
+        with (
+            patch.object(main_qml.sys, "platform", "darwin"),
+            patch.object(main_qml, "is_process_trusted", return_value=True) as trusted,
+        ):
+            self.assertTrue(main_qml._check_accessibility(locale_mgr, prompt=False))
+        trusted.assert_called_once_with(prompt=False)
 
     def test_accessibility_check_exception_fails_closed(self):
         locale_mgr = SimpleNamespace(tr=lambda key: key)

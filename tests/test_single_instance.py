@@ -55,6 +55,14 @@ class TryActivateExistingTests(unittest.TestCase):
         sock.write.assert_not_called()
 
     @patch("main_qml.QLocalSocket")
+    def test_hidden_login_launch_does_not_activate_existing_window(self, mock_sock_cls):
+        sock = MagicMock()
+        sock.waitForConnected.return_value = True
+        mock_sock_cls.return_value = sock
+        self.assertTrue(main_qml._try_activate_existing_instance("pipe", show=False))
+        sock.write.assert_called_once_with(main_qml._SINGLE_INSTANCE_HIDDEN_MSG)
+
+    @patch("main_qml.QLocalSocket")
     def test_returns_true_and_sends_payload_when_connected(self, mock_sock_cls):
         sock = MagicMock()
         sock.waitForConnected.return_value = True
@@ -68,6 +76,16 @@ class TryActivateExistingTests(unittest.TestCase):
 
 @unittest.skipIf(main_qml is None, "main_qml / PySide6 not available")
 class SingleInstanceAcquireTests(unittest.TestCase):
+    @patch("main_qml._try_activate_existing_instance", return_value=True)
+    def test_secondary_hidden_instance_does_not_request_show(self, try_activate):
+        app = _ensure_qapp()
+        server, code = main_qml._single_instance_acquire(
+            app, "any_name", show_existing=False
+        )
+        self.assertIsNone(server)
+        self.assertEqual(code, 0)
+        try_activate.assert_called_once_with("any_name", show=False)
+
     @patch("main_qml._try_activate_existing_instance", return_value=True)
     def test_secondary_instance_returns_exit_zero(self, _):
         app = _ensure_qapp()
@@ -112,3 +130,9 @@ class DrainActivateSocketTests(unittest.TestCase):
         mock_sock.waitForReadyRead.assert_called_once_with(300)
         mock_sock.readAll.assert_called_once()
         mock_sock.deleteLater.assert_called_once()
+
+    def test_returns_hidden_or_show_message(self):
+        sock = MagicMock()
+        sock.readAll.return_value = main_qml._SINGLE_INSTANCE_HIDDEN_MSG
+        self.assertEqual(main_qml._drain_local_activate_socket(sock),
+                         main_qml._SINGLE_INSTANCE_HIDDEN_MSG)

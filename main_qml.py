@@ -115,6 +115,7 @@ def _parse_cli_args(argv):
 
 
 _SINGLE_INSTANCE_ACTIVATE_MSG = b"show"
+_SINGLE_INSTANCE_HIDDEN_MSG = b"stay-hidden"
 
 
 def _single_instance_server_name() -> str:
@@ -128,28 +129,31 @@ def _single_instance_server_name() -> str:
     return f"mouser_instance_{digest}"
 
 
-def _try_activate_existing_instance(server_name: str, timeout_ms: int = 500) -> bool:
+def _try_activate_existing_instance(server_name: str, timeout_ms: int = 500,
+                                    *, show: bool = True) -> bool:
     sock = QLocalSocket()
     sock.connectToServer(server_name)
     if not sock.waitForConnected(timeout_ms):
         return False
-    sock.write(_SINGLE_INSTANCE_ACTIVATE_MSG)
+    sock.write(_SINGLE_INSTANCE_ACTIVATE_MSG if show else _SINGLE_INSTANCE_HIDDEN_MSG)
     sock.waitForBytesWritten(timeout_ms)
     sock.disconnectFromServer()
     return True
 
 
-def _drain_local_activate_socket(sock: QLocalSocket | None) -> None:
+def _drain_local_activate_socket(sock: QLocalSocket | None) -> bytes:
     if not sock:
-        return
+        return b""
     sock.waitForReadyRead(300)
-    sock.readAll()
+    message = bytes(sock.readAll())
     sock.deleteLater()
+    return message
 
 
-def _single_instance_acquire(app: QApplication, server_name: str):
+def _single_instance_acquire(app: QApplication, server_name: str,
+                             *, show_existing: bool = True):
     """Return (QLocalServer, None) if this process owns the instance, or (None, exit_code)."""
-    if _try_activate_existing_instance(server_name):
+    if _try_activate_existing_instance(server_name, show=show_existing):
         return None, 0
     server = QLocalServer(app)
     QLocalServer.removeServer(server_name)
@@ -160,7 +164,7 @@ def _single_instance_acquire(app: QApplication, server_name: str):
         return None, 1
     for _ in range(3):
         time.sleep(0.05)
-        if _try_activate_existing_instance(server_name):
+        if _try_activate_existing_instance(server_name, show=show_existing):
             return None, 0
         QLocalServer.removeServer(server_name)
         server.close()
@@ -545,11 +549,20 @@ else:
 class _MacOSQuitToTrayFilter(QObject):
     """Intercept app-level quit requests and hide the window instead."""
 
-    def __init__(self, root_window, parent=None, show_window=None):
+    def __init__(self, root_window, parent=None, show_window=None,
+                 startup_hidden=False):
         super().__init__(parent)
         self._root_window = root_window
         self._show_window = show_window
+        # LaunchServices can activate a login item once during startup. That
+        # is not a user request to open Settings; later Finder/Spotlight
+        # activations still reopen it even if LaunchServices reuses the process.
+        self._ignore_initial_activation = bool(startup_hidden)
         self._allow_quit = False
+        self._permission_setup_pending = False
+
+    def set_permission_setup_pending(self, pending: bool) -> None:
+        self._permission_setup_pending = bool(pending)
 
     def allow_quit(self) -> None:
         self._allow_quit = True
@@ -564,16 +577,28 @@ class _MacOSQuitToTrayFilter(QObject):
             # as the user's request to reopen Settings when the window is
             # hidden. The single-instance socket remains the normal path when
             # LaunchServices starts a second process.
-            if (event_type == QEvent.Type.ApplicationActivate
-                    and self._show_window is not None
-                    and self._root_window.visibility() == QWindow.Visibility.Hidden):
-                QTimer.singleShot(0, self._show_window)
+            if event_type == QEvent.Type.ApplicationActivate:
+                if self._ignore_initial_activation:
+                    self._ignore_initial_activation = False
+                    return False
+                if (not self._permission_setup_pending
+                        and self._show_window is not None
+                        and self._root_window.visibility() == QWindow.Visibility.Hidden):
+                    QTimer.singleShot(0, self._show_window)
                 return False
             if event_type != QEvent.Type.Quit:
                 return False
             if _macos_current_quit_is_system_session_event():
                 self.allow_quit()
                 return False
+            # The macOS privacy sheet can send an app-level Quit while it
+            # switches to System Settings. Do not mistake that transition for
+            # the user's request to hide Mouser. The explicit tray Quit still
+            # works via allow_quit(), and session shutdown still works above.
+            if self._permission_setup_pending:
+                if hasattr(event, "ignore"):
+                    event.ignore()
+                return True
             self._root_window.hide()
             if hasattr(event, "ignore"):
                 event.ignore()
@@ -1038,7 +1063,7 @@ class SystemIconProvider(QQuickImageProvider):
         return pixmap
 
 
-def _check_accessibility(_locale_mgr: "LocaleManager") -> bool:
+def _check_accessibility(_locale_mgr: "LocaleManager", *, prompt: bool = True) -> bool:
     """Verify the macOS Accessibility grant. Returns True only when
     AXIsProcessTrustedWithOptions confirms the grant; any other path
     (no grant, exception during the check) returns False so callers
@@ -1047,7 +1072,7 @@ def _check_accessibility(_locale_mgr: "LocaleManager") -> bool:
     if sys.platform != "darwin":
         return True
     try:
-        trusted = is_process_trusted(prompt=True)
+        trusted = is_process_trusted(prompt=prompt)
     except Exception as exc:
         print(f"[Mouser] Accessibility check failed: {exc}")
         return False
@@ -1066,7 +1091,8 @@ def _runtime_launch_path() -> str:
     return os.path.abspath(__file__)
 
 
-def _schedule_engine_start(engine, *, accessibility_granted: bool) -> bool:
+def _schedule_engine_start(engine, *, accessibility_granted: bool,
+                           on_accessibility_granted=None) -> bool:
     if accessibility_granted:
         QTimer.singleShot(0, lambda: (
             engine.start(),
@@ -1081,6 +1107,8 @@ def _schedule_engine_start(engine, *, accessibility_granted: bool) -> bool:
     def _poll_accessibility():
         if is_process_trusted():
             timer.stop()
+            if on_accessibility_granted is not None:
+                on_accessibility_granted()
             engine.start()
             print("[Mouser] Accessibility granted -- engine started")
 
@@ -1174,7 +1202,9 @@ def main():
         signal.signal(signal.SIGUSR1, _dump_threads)
 
     server_name = _single_instance_server_name()
-    single_server, single_exit = _single_instance_acquire(app, server_name)
+    single_server, single_exit = _single_instance_acquire(
+        app, server_name, show_existing=not start_hidden
+    )
     if single_exit is not None:
         sys.exit(single_exit)
 
@@ -1253,6 +1283,16 @@ def main():
     root_window = qml_engine.rootObjects()[0]
 
     def show_main_window():
+        # A hidden login launch must not show the native privacy sheet. Ask
+        # only once the user explicitly opens the window.
+        if sys.platform == "darwin" and not is_process_trusted():
+            def _prompt_for_visible_window():
+                if _MACOS_QUIT_FILTER is not None:
+                    _MACOS_QUIT_FILTER.set_permission_setup_pending(True)
+                if (_check_accessibility(locale_mgr)
+                        and _MACOS_QUIT_FILTER is not None):
+                    _MACOS_QUIT_FILTER.set_permission_setup_pending(False)
+            QTimer.singleShot(0, _prompt_for_visible_window)
         # Promote BEFORE show so the window registers with WindowServer's
         # foreground-app surfaces (Dock + Cmd+Tab + Mission Control) at
         # creation time on macOS. visibilityChanged below also catches the
@@ -1304,9 +1344,14 @@ def main():
     if sys.platform == "darwin":
         global _MACOS_QUIT_FILTER
         _MACOS_QUIT_FILTER = _MacOSQuitToTrayFilter(
-            root_window, app, show_window=show_main_window
+            root_window, app, show_window=show_main_window,
+            startup_hidden=launch_hidden,
         )
         app.installEventFilter(_MACOS_QUIT_FILTER)
+        if launch_hidden:
+            QTimer.singleShot(5000, lambda: setattr(
+                _MACOS_QUIT_FILTER, "_ignore_initial_activation", False
+            ))
         app.commitDataRequest.connect(
             lambda *_: _allow_macos_session_quit_if_requested(_MACOS_QUIT_FILTER)
         )
@@ -1315,8 +1360,9 @@ def main():
         )
 
     def _on_second_instance_activate():
-        _drain_local_activate_socket(single_server.nextPendingConnection())
-        show_main_window()
+        message = _drain_local_activate_socket(single_server.nextPendingConnection())
+        if message == _SINGLE_INSTANCE_ACTIVATE_MSG:
+            show_main_window()
 
     single_server.newConnection.connect(_on_second_instance_activate)
 
@@ -1324,12 +1370,6 @@ def main():
     print(f"[Startup] Engine create:    {(_t7-_t6)*1000:7.1f} ms")
     print(f"[Startup] QML load:         {(_t8-_t7)*1000:7.1f} ms")
     print(f"[Startup] TOTAL to window:  {(_t8-_t0)*1000:7.1f} ms")
-
-    # ── Accessibility check (macOS) ──────────────────────────────
-    accessibility_granted = _check_accessibility(locale_mgr)
-
-    # ── Start engine AFTER window is ready (deferred) ──────────
-    _schedule_engine_start(engine, accessibility_granted=accessibility_granted)
 
     # ── System Tray ────────────────────────────────────────────
     tray = QSystemTrayIcon(_tray_icon(), app)
@@ -1470,6 +1510,26 @@ def main():
     if (launch_hidden and not backend.hideTrayIcon
             and QSystemTrayIcon.isSystemTrayAvailable()):
         _schedule_tray_minimized_notice(tray, locale_mgr)
+
+    # Request macOS permission only after the window, tray and event loop are
+    # ready. Asking before app.exec() lets the native privacy sheet switch to
+    # System Settings while Qt is still setting up its first window.
+    def _finish_startup():
+        if (sys.platform == "darwin" and not launch_hidden
+                and _MACOS_QUIT_FILTER is not None):
+            _MACOS_QUIT_FILTER.set_permission_setup_pending(True)
+        granted = _check_accessibility(locale_mgr, prompt=not launch_hidden)
+        if granted and _MACOS_QUIT_FILTER is not None:
+            _MACOS_QUIT_FILTER.set_permission_setup_pending(False)
+        _schedule_engine_start(
+            engine, accessibility_granted=granted,
+            on_accessibility_granted=(
+                lambda: _MACOS_QUIT_FILTER.set_permission_setup_pending(False)
+                if _MACOS_QUIT_FILTER is not None else None
+            ),
+        )
+
+    QTimer.singleShot(0, _finish_startup)
 
     # ── Run ────────────────────────────────────────────────────
     try:

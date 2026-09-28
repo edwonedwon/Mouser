@@ -137,7 +137,7 @@ class ApplyLoginStartupMacTests(unittest.TestCase):
 
         self.assertEqual(
             args,
-            ["/opt/homebrew/bin/python3", "/tmp/Mouser/main_qml.py"],
+            ["/opt/homebrew/bin/python3", "/tmp/Mouser/main_qml.py", "--start-hidden"],
         )
 
     def test_program_arguments_use_bundle_executable_when_frozen(self):
@@ -149,7 +149,7 @@ class ApplyLoginStartupMacTests(unittest.TestCase):
         ):
             args = st._program_arguments()
 
-        self.assertEqual(args, ["/Applications/Mouser.app/Contents/MacOS/Mouser"])
+        self.assertEqual(args, ["/Applications/Mouser.app/Contents/MacOS/Mouser", "--start-hidden"])
 
     def test_macos_plist_path_uses_canonical_launch_agent_name(self):
         with patch("os.path.expanduser", side_effect=lambda p: p.replace("~", "/Users/test")):
@@ -185,6 +185,23 @@ class ApplyLoginStartupMacTests(unittest.TestCase):
             m_lc.assert_called_with(
                 ["launchctl", "bootstrap", domain, plist]
             )
+
+    def test_macos_sync_does_not_bootout_unchanged_login_agent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            plist = os.path.join(tmp, "io.github.tombadash.mouser.plist")
+            with (
+                patch.object(sys, "platform", "darwin"),
+                patch("core.startup.os.getuid", return_value=501, create=True),
+                patch.object(st, "supports_login_startup", return_value=True),
+                patch.object(st, "_macos_plist_path", return_value=plist),
+                patch.object(st, "_program_arguments", return_value=["/X/Mouser", "--start-hidden"]),
+                patch.object(st, "_launchctl_run") as launchctl,
+            ):
+                launchctl.return_value = MagicMock(returncode=0)
+                st.apply_login_startup(True)
+                launchctl.reset_mock()
+                st.apply_login_startup(True)
+                launchctl.assert_not_called()
 
     def test_macos_enable_raises_and_removes_plist_when_bootstrap_fails(self):
         domain = "gui/501"
