@@ -30,6 +30,17 @@ from core.logi_devices import (
     resolve_device,
 )
 
+# IOHIDLib.h enum values (not Boolean values): Granted=0, Denied=1,
+# Unknown=2. Keeping this outside the macOS import guard makes it testable.
+IOHID_ACCESS_GRANTED = 0
+IOHID_ACCESS_DENIED = 1
+IOHID_ACCESS_UNKNOWN = 2
+
+
+def _hid_listen_access_needs_request(access: int) -> bool:
+    return access != IOHID_ACCESS_GRANTED
+
+
 _HID_MODULE_NAME = None
 try:
     # The PyPI hidapi Linux wheels expose `hid` as the libusb backend and
@@ -408,7 +419,6 @@ if sys.platform == "darwin":
         _K_IOHID_REPORT_TYPE_INPUT = 0
         _K_IOHID_REPORT_TYPE_OUTPUT = 1
         _K_IOHID_REQUEST_TYPE_LISTEN_EVENT = 1
-        _K_IOHID_ACCESS_TYPE_GRANTED = 1
         _K_IORETURN_NOT_PERMITTED = 0xE00002E2
         _HID_ACCESS_PROMPTED = False
         _K_CF_RUN_LOOP_DEFAULT_MODE = c_void_p.in_dll(_cf, "kCFRunLoopDefaultMode")
@@ -472,7 +482,9 @@ if sys.platform == "darwin":
                 return False
             try:
                 access = int(_iokit.IOHIDCheckAccess(_K_IOHID_REQUEST_TYPE_LISTEN_EVENT))
-                if access == _K_IOHID_ACCESS_TYPE_GRANTED:
+                if not _hid_listen_access_needs_request(access):
+                    print(f"[HidGesture] HID listen access granted, but {reason} "
+                          "returned not permitted; check device authorization")
                     return True
                 if not _HID_ACCESS_PROMPTED:
                     suffix = f" after {reason}" if reason else ""
@@ -481,7 +493,12 @@ if sys.platform == "darwin":
                         f"permission is not granted{suffix}; requesting access"
                     )
                     _HID_ACCESS_PROMPTED = True
-                    _iokit.IOHIDRequestAccess(_K_IOHID_REQUEST_TYPE_LISTEN_EVENT)
+                    granted = bool(_iokit.IOHIDRequestAccess(
+                        _K_IOHID_REQUEST_TYPE_LISTEN_EVENT
+                    ))
+                    print(f"[HidGesture] HID listen access request: "
+                          f"{'granted' if granted else 'not granted'} "
+                          f"(previous status={access})")
                 return False
             except Exception as exc:
                 print(f"[HidGesture] HID listen access check failed: {exc}")

@@ -1,7 +1,7 @@
 PY := .venv/bin/python
 APP := dist/Mouser.app
 
-.PHONY: dev run-dev run release run-release install test quit clean
+.PHONY: dev run-dev run release run-release install reset-permissions test quit clean
 
 $(PY): requirements.txt
 	python3 -m venv .venv
@@ -30,25 +30,21 @@ run-release: release quit
 
 # Replaces the installed copy; ditto preserves the bundle's signature.
 install: $(PY)
-	# Remove a source-checkout LaunchAgent first; otherwise it can restart the
-	# Terminal/Python build while the packaged app is being installed.
-	-launchctl bootout gui/$$(id -u) io.github.tombadash.mouser
-	rm -f "$$HOME/Library/LaunchAgents/io.github.tombadash.mouser.plist"
-	$(MAKE) quit
-	# Reset the packaged app's Accessibility/TCC grant before replacing an ad-hoc
-	# signed build. Rebuilds can change the code identity, leaving macOS with a
-	# stale approval record that prevents the engine/mouse hook from starting.
-	-tccutil reset Accessibility io.github.tombadash.mouser
-	-tccutil reset ListenEvent io.github.tombadash.mouser
+	# Build first: a compiler/signing/Keychain failure must leave the running
+	# installed app untouched. Preserve TCC grants; never reset them here.
 	# Remove source-checkout and previous packaged builds before rebuilding. This
 	# prevents Spotlight from finding stale Mouser.app copies in the repository.
 	rm -rf build dist
 	$(MAKE) release
-	rm -rf /Applications/Mouser.app
-	ditto $(APP) /Applications/Mouser.app
+	$(PY) tools/install_macos_app.py $(APP) /Applications/Mouser.app
 	# Keep only the installed copy; do not leave another app bundle in the repo.
 	rm -rf build dist
-	open /Applications/Mouser.app
+
+# Only for deliberate permission troubleshooting; normal installs must not
+# revoke previously granted Accessibility and Input Monitoring access.
+reset-permissions:
+	tccutil reset Accessibility io.github.tombadash.mouser
+	tccutil reset ListenEvent io.github.tombadash.mouser
 
 test: $(PY)
 	$(PY) -m unittest discover -s tests

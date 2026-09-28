@@ -164,6 +164,7 @@ class MacOSStatusItemReinstallTests(unittest.TestCase):
         "_MACOS_ACTIVATION_POLICY_REGULAR",
         "_MACOS_NATIVE_STATUS_ITEM",
         "_MACOS_NATIVE_STATUS_TARGET",
+        "_MACOS_STATUS_ITEM_HIDDEN",
         "_MACOS_STATUS_ITEM_PARAMS",
         "_MACOS_STATUS_ITEM_REINSTALL_GENERATION",
     )
@@ -194,6 +195,49 @@ class MacOSStatusItemReinstallTests(unittest.TestCase):
             main_qml._schedule_macos_status_item_reinstall()
         self.assertEqual([delay for delay, _ in callbacks], [0, 250])
         return [callback for _, callback in callbacks]
+
+    def test_hide_removes_current_replacement_not_original_handle(self):
+        old = MagicMock(name="old")
+        current = MagicMock(name="current")
+        bar = MagicMock()
+        appkit = SimpleNamespace(
+            NSStatusBar=SimpleNamespace(systemStatusBar=lambda: bar)
+        )
+        main_qml._MACOS_NATIVE_STATUS_ITEM = current
+        main_qml._MACOS_NATIVE_STATUS_TARGET = object()
+        main_qml._MACOS_STATUS_ITEM_PARAMS = ("menu", lambda: None)
+        with (
+            patch.object(main_qml.sys, "platform", "darwin"),
+            patch.object(main_qml, "_macos_appkit", return_value=appkit),
+        ):
+            main_qml._set_macos_status_item_hidden(True)
+        bar.removeStatusItem_.assert_called_once_with(current)
+        old.setVisible_.assert_not_called()
+        self.assertIsNone(main_qml._MACOS_NATIVE_STATUS_ITEM)
+        self.assertTrue(main_qml._MACOS_STATUS_ITEM_HIDDEN)
+
+    def test_hidden_item_is_not_reinstalled_by_pending_callbacks(self):
+        main_qml._MACOS_STATUS_ITEM_PARAMS = ("menu", lambda: None)
+        callbacks = self._queue_reinstall_callbacks()
+        with (
+            patch.object(main_qml.sys, "platform", "darwin"),
+            patch.object(main_qml, "_install_native_macos_status_item") as install,
+        ):
+            main_qml._set_macos_status_item_hidden(True)
+            for callback in callbacks:
+                callback()
+        install.assert_not_called()
+
+    def test_show_reinstalls_native_item(self):
+        main_qml._MACOS_STATUS_ITEM_HIDDEN = True
+        params = ("menu", lambda: None)
+        main_qml._MACOS_STATUS_ITEM_PARAMS = params
+        with (
+            patch.object(main_qml.sys, "platform", "darwin"),
+            patch.object(main_qml, "_install_native_macos_status_item") as install,
+        ):
+            main_qml._set_macos_status_item_hidden(False)
+        install.assert_called_once_with(*params)
 
     def test_successful_immediate_reinstall_skips_delayed_replacement(self):
         main_qml._MACOS_STATUS_ITEM_PARAMS = ("menu", lambda: None)

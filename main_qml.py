@@ -394,6 +394,7 @@ _MACOS_DOCK_ICON_NSIMAGE = None
 _MACOS_ACTIVATION_POLICY_REGULAR: "bool | None" = None
 _MACOS_NATIVE_STATUS_ITEM = None
 _MACOS_NATIVE_STATUS_TARGET = None
+_MACOS_STATUS_ITEM_HIDDEN = False
 # (qmenu, on_left_click) captured only after a successful native install, so
 # the status item can be re-created after an activation-policy flip detaches
 # it (see below) without later replacing the Qt fallback after a failed setup.
@@ -719,7 +720,8 @@ def _schedule_macos_status_item_reinstall() -> None:
     flip. The delayed retry runs only when the immediate attempt failed or
     AppKit subsequently detached the replacement. No-op until a native item
     has first been installed successfully."""
-    if sys.platform != "darwin" or _MACOS_STATUS_ITEM_PARAMS is None:
+    if (sys.platform != "darwin" or _MACOS_STATUS_ITEM_PARAMS is None
+            or _MACOS_STATUS_ITEM_HIDDEN):
         return
     generation = _MACOS_STATUS_ITEM_REINSTALL_GENERATION
     first_attempt_succeeded = False
@@ -728,7 +730,8 @@ def _schedule_macos_status_item_reinstall() -> None:
         return generation == _MACOS_STATUS_ITEM_REINSTALL_GENERATION
 
     def _reinstall() -> bool:
-        if not _is_current() or _MACOS_STATUS_ITEM_PARAMS is None:
+        if (not _is_current() or _MACOS_STATUS_ITEM_PARAMS is None
+                or _MACOS_STATUS_ITEM_HIDDEN):
             return False
         return _install_native_macos_status_item(*_MACOS_STATUS_ITEM_PARAMS) is not None
 
@@ -924,6 +927,39 @@ def _install_native_macos_status_item(qmenu, on_left_click):
     # a later activation-policy change from creating a second icon beside it.
     _MACOS_STATUS_ITEM_PARAMS = (qmenu, on_left_click)
     return status_item
+
+
+def _set_macos_status_item_hidden(hidden: bool) -> None:
+    """Remove the live AppKit item when hidden; reinstall on re-enable.
+
+    setVisible_ on an old NSStatusItem doesn't affect replacements created by
+    activation-policy flips. Removing the current item also guarantees the
+    menu-bar slot is actually released, rather than merely making it blank.
+    """
+    global _MACOS_STATUS_ITEM_HIDDEN, _MACOS_NATIVE_STATUS_ITEM
+    global _MACOS_NATIVE_STATUS_TARGET, _MACOS_STATUS_ITEM_REINSTALL_GENERATION
+    hidden = bool(hidden)
+    if hidden == _MACOS_STATUS_ITEM_HIDDEN:
+        return
+    if sys.platform != "darwin":
+        return
+    if hidden:
+        item = _MACOS_NATIVE_STATUS_ITEM
+        if item is not None:
+            appkit = _macos_appkit()
+            if appkit is None:
+                return
+            try:
+                appkit.NSStatusBar.systemStatusBar().removeStatusItem_(item)
+            except Exception as exc:
+                print(f"[Mouser] Failed to hide native status item: {exc}")
+                return
+            _MACOS_NATIVE_STATUS_ITEM = None
+            _MACOS_NATIVE_STATUS_TARGET = None
+    _MACOS_STATUS_ITEM_HIDDEN = hidden
+    _MACOS_STATUS_ITEM_REINSTALL_GENERATION += 1
+    if not hidden and _MACOS_NATIVE_STATUS_ITEM is None and _MACOS_STATUS_ITEM_PARAMS is not None:
+        _install_native_macos_status_item(*_MACOS_STATUS_ITEM_PARAMS)
 
 
 def _qcolor_white():
@@ -1495,14 +1531,11 @@ def main():
     # changes; both the Qt tray and the native NSStatusItem are covered.
     def _apply_tray_visibility():
         hidden = bool(backend.hideTrayIcon)
-        if native_tray is not None:
-            try:
-                native_tray.setVisible_(not hidden)
-            except Exception as exc:
-                print(f"[Mouser] native status item visibility failed: {exc}")
-            tray.setVisible(False)   # icon surface stays owned by AppKit
-        else:
-            tray.setVisible(not hidden)
+        if sys.platform == "darwin":
+            _set_macos_status_item_hidden(hidden)
+        # The native item can be replaced on every activation-policy change;
+        # never use the original `native_tray` handle to control visibility.
+        tray.setVisible(not hidden and _MACOS_NATIVE_STATUS_ITEM is None)
 
     _apply_tray_visibility()
     backend.settingsChanged.connect(_apply_tray_visibility)

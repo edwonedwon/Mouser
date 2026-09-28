@@ -11,6 +11,12 @@ SOURCE_ICON="$ROOT_DIR/images/logo_icon.png"
 ENTITLEMENTS="$ROOT_DIR/build_resources/Mouser.entitlements"
 TARGET_ARCH="${PYINSTALLER_TARGET_ARCH:-}"
 SIGN_IDENTITY="${MOUSER_SIGN_IDENTITY:-}"
+# Persist an explicitly selected local certificate without committing a
+# developer's identity. Certificate-backed designated requirements survive
+# rebuilds; ad-hoc requirements are tied to the changing executable hash.
+if [[ -z "$SIGN_IDENTITY" && -f "$ROOT_DIR/.mouser-signing-identity" ]]; then
+  SIGN_IDENTITY="$(< "$ROOT_DIR/.mouser-signing-identity")"
+fi
 export PYINSTALLER_CONFIG_DIR="$BUILD_DIR/pyinstaller"
 PYTHON=""
 PYTHON_SOURCE=""

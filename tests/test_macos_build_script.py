@@ -277,6 +277,16 @@ class MacOSBuildScriptTests(unittest.TestCase):
         self.assertEqual(len(codesign), 1)
         self.assertIn("--force --deep --sign -", codesign[0])
 
+    def test_local_signing_identity_is_reused_and_environment_overrides_it(self):
+        (self.root / ".mouser-signing-identity").write_text("LOCAL-ID\n")
+        result = self._run_script()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Code-signing with identity: LOCAL-ID", result.stdout)
+        self.assertFalse(any("--sign - " in line for line in self._codesign_lines()))
+        result = self._run_script(MOUSER_SIGN_IDENTITY="OVERRIDE-ID")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Code-signing with identity: OVERRIDE-ID", result.stdout)
+
     def test_identity_signing_order_and_verify_failure(self):
         result = self._run_script(MOUSER_SIGN_IDENTITY="IDENTITY")
 

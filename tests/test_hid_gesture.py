@@ -1206,6 +1206,17 @@ class MxMaster4ConstantTests(unittest.TestCase):
         self.assertEqual(hid_gesture.FEAT_FORCE_SENSING, 0x19C0)
 
 
+class MacHidAccessEnumTests(unittest.TestCase):
+    def test_denied_is_not_granted(self):
+        # IOHIDLib.h uses 0 for Granted and 1 for Denied. A reversed
+        # comparison suppresses IOHIDRequestAccess when macOS blocks HID.
+        self.assertEqual(hid_gesture.IOHID_ACCESS_GRANTED, 0)
+        self.assertEqual(hid_gesture.IOHID_ACCESS_DENIED, 1)
+        self.assertFalse(hid_gesture._hid_listen_access_needs_request(0))
+        self.assertTrue(hid_gesture._hid_listen_access_needs_request(1))
+        self.assertTrue(hid_gesture._hid_listen_access_needs_request(2))
+
+
 class HidReconnectStormTests(unittest.TestCase):
     """Regression coverage for issue #238: the reconnect/probe throttle.
 
